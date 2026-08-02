@@ -1,0 +1,19 @@
+# Secrets — NE JAMAIS committer
+.env
+
+# Base de données (contient réglages/clés + données perso)
+*.db
+*.db.bak
+
+# Digests générés au runtime
+digests/
+
+# Python
+__pycache__/
+*.pyc
+
+# Divers / OS / éditeur
+.DS_Store
+.claude/
+venv/
+*.zip
