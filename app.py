@@ -530,7 +530,7 @@ PAGE = r"""<!doctype html><html lang="fr"><head>
  .recap-body li::before{content:"›";position:absolute;left:0;color:var(--gold);opacity:.75;font-weight:700}
  .recap-body li a{color:var(--ink);text-decoration:none;border-bottom:1px solid transparent}
  .recap-body li a:hover{color:var(--gold);border-bottom-color:var(--line)}
- .recap-fix{font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--osv);margin-left:7px;white-space:nowrap}
+ .recap-fix{font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--osv);margin-left:7px;overflow-wrap:anywhere}
  .recap-ctx{color:var(--faint);font-size:13px;line-height:1.45;margin-top:2px}
  .recap-empty{color:var(--muted);font-size:14px;padding:16px 0 4px;font-style:italic}
  .section-h{display:flex;align-items:center;gap:12px;margin:34px 0 16px}
