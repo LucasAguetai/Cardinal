@@ -3,8 +3,26 @@ Rendu HTML du digest : un article autonome (CSS inline), agréable à lire.
 Aucune dépendance externe — juste du templating string + html.escape.
 """
 
+import os
 import html
 import datetime as dt
+
+# Fuseau d'affichage explicite : sans ça, .astimezone() suit le fuseau du serveur
+# (souvent UTC en prod) et l'heure paraît décalée. Configurable via CARDINAL_TZ.
+try:
+    from zoneinfo import ZoneInfo
+    _TZ = ZoneInfo(os.getenv("CARDINAL_TZ", "Europe/Paris"))
+except Exception:
+    _TZ = None  # repli : fuseau local du système
+
+
+def _now() -> dt.datetime:
+    return dt.datetime.now(_TZ) if _TZ else dt.datetime.now().astimezone()
+
+
+def _to_local(d: dt.datetime) -> dt.datetime:
+    return d.astimezone(_TZ) if _TZ else d.astimezone()
+
 
 _BADGE = {
     "high": ("Priorité haute", "#b42318", "#fef3f2"),
@@ -50,7 +68,7 @@ def _item_html(item: dict) -> str:
 
 
 def render_html(digest: dict, topic) -> str:
-    now = dt.datetime.now()
+    now = _now()
     since = now - dt.timedelta(hours=topic.frequency_hours)
     window = f"{since.strftime('%d/%m')} → {now.strftime('%d/%m/%Y')}"
 
@@ -138,7 +156,7 @@ def _parse_dt(iso: str) -> dt.datetime:
 
 def _feed_item_html(row: dict) -> str:
     label, color, bg = _BADGE.get(row.get("importance", "low"), _BADGE["low"])
-    when = _parse_dt(row.get("created_at", "")).astimezone()
+    when = _to_local(_parse_dt(row.get("created_at", "")))
     paras = "".join(
         f"<p>{_esc(p.strip())}</p>"
         for p in (row.get("body", "") or "").split("\n")
@@ -165,11 +183,11 @@ def _feed_item_html(row: dict) -> str:
 
 def render_feed(topic, items: list, days: int = 30) -> str:
     """Page autonome : le feed continu d'un sujet, groupé par jour."""
-    now = dt.datetime.now()
+    now = _now()
 
     blocks, current_day = [], None
     for row in items:
-        d = _parse_dt(row.get("created_at", "")).astimezone()
+        d = _to_local(_parse_dt(row.get("created_at", "")))
         day_key = d.strftime("%Y-%m-%d")
         if day_key != current_day:
             current_day = day_key

@@ -35,6 +35,19 @@ os.makedirs(DIGESTS_DIR, exist_ok=True)
 # Chemins absolus -> l'appli tourne quel que soit le dossier courant
 store.DB_PATH = os.path.join(BASE_DIR, "cardinal.db")
 
+# Fuseau d'affichage explicite (sinon .astimezone() suit le fuseau serveur, souvent
+# UTC en prod -> heures décalées). Configurable via CARDINAL_TZ. Défaut : Europe/Paris.
+try:
+    from zoneinfo import ZoneInfo
+    TZ = ZoneInfo(os.getenv("CARDINAL_TZ", "Europe/Paris"))
+except Exception:
+    TZ = None
+
+
+def _to_local(d: dt.datetime) -> dt.datetime:
+    return d.astimezone(TZ) if TZ else d.astimezone()
+
+
 app = Flask(__name__)
 store.init_db()
 
@@ -223,7 +236,7 @@ def index():
             "config_text": _config_text(t),
             "feed_n": store.feed_count(t.id),
             "unread": store.unread_count(t.id),
-            "last_at": last["created_at"][:16].replace("T", " ") if last else None,
+            "last_at": _to_local(dt.datetime.fromisoformat(last["created_at"])).strftime("%d/%m %H:%M") if last else None,
             "enabled": enabled,
             "next_ts": _next_run_ts(t) if (enabled and sched_on) else None,
         })
@@ -382,7 +395,7 @@ def _first_sentence(text: str, maxlen: int = 200) -> str:
 
 def _day_range(offset: int):
     """Bornes UTC [start, end[ du jour local à `offset` jours en arrière, + libellé."""
-    now_local = dt.datetime.now().astimezone()
+    now_local = _to_local(dt.datetime.now(dt.timezone.utc))
     target = (now_local - dt.timedelta(days=offset)).date()
     start_local = dt.datetime(target.year, target.month, target.day, tzinfo=now_local.tzinfo)
     end_local = start_local + dt.timedelta(days=1)
