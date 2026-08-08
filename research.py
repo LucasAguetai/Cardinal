@@ -464,6 +464,8 @@ SYSTEM_OSV = """Tu es un analyste sécurité. On te donne des vulnérabilités O
 pour les paquets d'un utilisateur. Rédige un digest en français, priorisé.
 
 - Un item par vulnérabilité notable (regroupe les doublons).
+- Commence TOUJOURS le titre par le paquet affecté entre crochets (champ "package"),
+  ex. "[Next.js] ...", "[requests] déni de service via...". Puis décris le risque.
 - Explique : quel paquet, quel risque.
 - importance = high pour critique/haute, medium pour moyenne, low sinon.
 - sources : réutilise les urls de références fournies.
