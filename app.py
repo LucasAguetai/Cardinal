@@ -164,7 +164,8 @@ def start_scheduler():
 
 # --- Helpers vue ----------------------------------------------------------
 SOURCE_LABEL = {"news": "Actu (auto)", "web": "RSS (liens)",
-                "osv": "CVE dépendances", "nvd": "CVE produits"}
+                "osv": "CVE dépendances", "nvd": "CVE produits",
+                "kev": "CVE exploitées (KEV)"}
 
 
 def _summary(t: Topic) -> str:
@@ -177,6 +178,8 @@ def _summary(t: Topic) -> str:
     if t.source == "nvd":
         s = f"{len(t.keywords)} produit(s)"
         return s + (f" · ≥ {t.min_severity}" if t.min_severity else "")
+    if t.source == "kev":
+        return f"{len(t.keywords)} produit(s) · exploitées"
     return ""
 
 
@@ -193,7 +196,7 @@ def _next_run_ts(t: Topic) -> int:
 
 def _config_text(t: Topic) -> str:
     """Le contenu éditable, une entrée par ligne, selon la source."""
-    if t.source in ("nvd", "news"):
+    if t.source in ("nvd", "news", "kev"):
         return "\n".join(t.keywords)
     if t.source == "web":
         return "\n".join(t.feeds)
@@ -212,6 +215,8 @@ def _parse_config(source, text, min_severity=""):
     elif source == "nvd":
         cfg["keywords"] = lines
         cfg["min_severity"] = min_severity or ""
+    elif source == "kev":
+        cfg["keywords"] = lines
     elif source == "osv":
         for l in lines:
             parts = l.split()
@@ -612,6 +617,7 @@ PAGE = r"""<!doctype html><html lang="fr"><head>
  .badge.b-web{background:var(--web-bg);color:var(--web)}
  .badge.b-osv{background:var(--osv-bg);color:var(--osv)}
  .badge.b-nvd{background:var(--nvd-bg);color:var(--nvd)}
+ .badge.b-kev{background:rgba(240,64,73,.16);color:#ff6b6b}
  .card h3{margin:2px 0 0;font-size:1.16rem;letter-spacing:.01em;color:#fbf3df}
  .card .meta{color:var(--muted);font-size:12.5px;font-family:ui-monospace,Menlo,monospace}
  .status{font-size:13px;color:var(--muted);min-height:18px}
@@ -758,6 +764,7 @@ PAGE = r"""<!doctype html><html lang="fr"><head>
      <select name="source" class="src" onchange="applySrc(this.closest('form'))">
       <option value="news">Actu — je tape juste le sujet (auto, conseillé)</option>
       <option value="web">RSS — je fournis les flux (avancé)</option>
+      <option value="kev">CVE exploitées — patch urgent (CISA KEV)</option>
       <option value="nvd">CVE produits (iOS, Windows…)</option>
       <option value="osv">CVE dépendances (paquets)</option>
      </select></div>
@@ -846,6 +853,7 @@ PAGE = r"""<!doctype html><html lang="fr"><head>
      <select name="source" class="src" onchange="applySrc(this.closest('form'))">
       <option value="news">Actu — je tape juste le sujet (auto, conseillé)</option>
       <option value="web">RSS — je fournis les flux (avancé)</option>
+      <option value="kev">CVE exploitées — patch urgent (CISA KEV)</option>
       <option value="nvd">CVE produits (iOS, Windows…)</option>
       <option value="osv">CVE dépendances (paquets)</option>
      </select></div>
@@ -874,6 +882,7 @@ const SRC={
  web:{label:'Un flux RSS par ligne',hint:"Souvent l'URL du site + /feed ou /rss.",ph:'https://exemple.com/feed',sev:false},
  nvd:{label:'Un produit par ligne (mot-clé)',hint:'Ex: Apple iOS · Windows 11 · WireGuard. Préfixe le fabricant = moins de bruit.',ph:'Apple iOS\nWindows 11\nWireGuard',sev:true},
  osv:{label:'Un paquet par ligne : nom écosystème',hint:'Écosystèmes : PyPI, npm, Go, crates.io, Maven, NuGet…',ph:'requests PyPI\nexpress npm',sev:false},
+ kev:{label:'Un produit par ligne (mot-clé)',hint:'CVE activement exploitées (CISA KEV), temps quasi réel, sans LLM. Préfixe l\'éditeur pour éviter le bruit (Apple iOS ≠ Cisco IOS). Nom AMONT, pas la distro (Ubuntu/CentOS…).',ph:'Google Chrome\nMozilla Firefox\nApple iOS\nApple macOS\nMicrosoft Windows\nOpenSSH\nLinux Kernel',sev:false},
 };
 // Adapte libellés/placeholder/sévérité au type de source, pour un formulaire donné.
 function applySrc(form){

@@ -669,6 +669,83 @@ def research_nvd(topic) -> dict:
 
 
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Backend "kev" (CVE activement exploitées) : CISA KEV -> items directs (sans LLM)
+# --------------------------------------------------------------------------
+# La liste KEV de la CISA recense les CVE EXPLOITÉES dans la nature, mise à jour
+# en quasi temps réel. Données déjà propres et curées -> on construit les items
+# SANS LLM (donc AUCUN risque de quota 429/413/404). On matche les mots-clés
+# produits de l'utilisateur sur le couple éditeur+produit (champs structurés),
+# ce qui limite le bruit. KEV suit le produit AMONT (ex. « Windows », « Linux
+# Kernel », « OpenSSH ») : tape le nom amont, pas la distro (Ubuntu/CentOS…).
+KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+KEV_MAX_ITEMS = 30
+
+
+def research_kev(topic) -> dict:
+    since = _cve_since(topic)
+    # Limites de mots : « iOS » matche « Apple iOS » mais PAS « FortiOS »/« BIOS »
+    # (sous-mot). Astuce : préfixe l'éditeur (« Apple iOS ») pour ne pas attraper
+    # « Cisco IOS ». Match sur éditeur+produit (structuré), pas la description.
+    pats = [re.compile(r"\b" + re.escape(k.strip()) + r"\b", re.I)
+            for k in topic.keywords if k.strip()]
+
+    r = requests.get(KEV_URL, timeout=40)
+    r.raise_for_status()
+    catalog = r.json().get("vulnerabilities", [])
+
+    matched = []
+    for v in catalog:
+        try:
+            added = dt.datetime.fromisoformat(v.get("dateAdded", "")).replace(tzinfo=dt.timezone.utc)
+        except Exception:
+            continue
+        if added < since:
+            continue
+        hay = f"{v.get('vendorProject', '')} {v.get('product', '')}"
+        if pats and not any(p.search(hay) for p in pats):
+            continue
+        matched.append((added, v))
+
+    matched.sort(key=lambda x: x[0], reverse=True)  # plus récentes d'abord
+    matched = matched[:KEV_MAX_ITEMS]
+
+    if not matched:
+        return {
+            "headline": f"{topic.name} — aucune CVE exploitée",
+            "summary": f"Aucune CVE activement exploitée (CISA KEV) ajoutée sur les "
+                       f"{CVE_LOOKBACK_DAYS} derniers jours pour tes produits. RAS.",
+            "items": [], "_item_keys": [],
+        }
+
+    items, item_keys = [], []
+    for added, v in matched:
+        cve = v.get("cveID", "")
+        product = f"{v.get('vendorProject', '')} {v.get('product', '')}".strip()
+        due = v.get("dueDate", "")
+        body = (v.get("shortDescription", "") or "").strip()
+        action = (v.get("requiredAction", "") or "").strip()
+        if action:
+            body += f"\n\nAction CISA : {action}"
+        if v.get("knownRansomwareCampaignUse", "") == "Known":
+            body += "\n\n⚠️ Utilisée dans des campagnes de rançongiciel connues."
+        items.append({
+            "title": f"[{product}] {cve} — {v.get('vulnerabilityName', '') or 'exploitée'}",
+            "body": body,
+            "importance": "high",  # exploitée dans la nature -> priorité maximale
+            "fix": f"Correctif éditeur — échéance CISA {due}" if due else "Appliquer le correctif éditeur",
+            "sources": [{"title": cve, "url": f"https://nvd.nist.gov/vuln/detail/{cve}"}],
+        })
+        item_keys.append(cve)
+
+    return {
+        "headline": f"{topic.name} — {len(items)} CVE exploitée(s)",
+        "summary": "CVE activement exploitées (source CISA KEV) touchant tes produits — "
+                   "à corriger en priorité.",
+        "items": items, "_item_keys": item_keys,
+    }
+
+
 def research(topic) -> dict:
     if topic.source == "news":
         return research_news(topic)
@@ -678,4 +755,6 @@ def research(topic) -> dict:
         return research_osv(topic)
     if topic.source == "nvd":
         return research_nvd(topic)
+    if topic.source == "kev":
+        return research_kev(topic)
     raise ValueError(f"Source inconnue : {topic.source}")
