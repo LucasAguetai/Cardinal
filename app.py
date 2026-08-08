@@ -12,6 +12,7 @@ import os
 import time
 import uuid
 import threading
+import subprocess
 import datetime as dt
 
 from flask import (
@@ -41,6 +42,8 @@ store.init_db()
 # En local, sans CARDINAL_PASSWORD, aucun login n'est demandé. En production,
 # on met CARDINAL_PASSWORD=... pour protéger l'accès (et donc tes clés/quotas).
 CARDINAL_PASSWORD = os.getenv("CARDINAL_PASSWORD")
+# Nom du service systemd à redémarrer depuis le bouton « Mettre à jour » (prod).
+SERVICE_NAME = os.getenv("CARDINAL_SERVICE", "cardinal")
 # Clé de session stable (survit aux redémarrages) : env, sinon stockée en base.
 app.secret_key = os.getenv("CARDINAL_SECRET_KEY") or store.get_setting("SECRET_KEY")
 if not app.secret_key:
@@ -315,6 +318,46 @@ def api_run(tid):
 def api_status(job_id):
     with JOBS_LOCK:
         return jsonify(JOBS.get(job_id, {"status": "unknown"}))
+
+
+def _delayed_restart():
+    """Redémarre le service APRÈS que la réponse HTTP soit partie (sinon on tue
+    le process en plein envoi). --no-block : systemd (PID 1) mène le restart même
+    si ce client meurt avec le service."""
+    time.sleep(1.5)
+    try:
+        subprocess.Popen(["systemctl", "restart", "--no-block", SERVICE_NAME],
+                         start_new_session=True)
+    except Exception as e:
+        print(f"[update] restart échec : {e}")
+
+
+@app.route("/api/update", methods=["POST"])
+def api_update():
+    # Action puissante (git + restart en root) : on l'interdit tant qu'aucun mot
+    # de passe ne protège l'accès, pour qu'une instance ouverte ne soit pas pilotable.
+    if not CARDINAL_PASSWORD:
+        return jsonify({"ok": False, "output": "Indisponible : définis CARDINAL_PASSWORD."}), 403
+
+    def _git(*args):
+        return subprocess.run(["git", *args], cwd=BASE_DIR, capture_output=True,
+                              text=True, timeout=60)
+
+    try:
+        before = _git("rev-parse", "HEAD").stdout.strip()
+        pull = _git("pull", "--ff-only")
+        after = _git("rev-parse", "HEAD").stdout.strip()
+    except Exception as e:
+        return jsonify({"ok": False, "output": f"Échec git : {e}"}), 500
+
+    output = (pull.stdout + pull.stderr).strip() or "(pas de sortie)"
+    if pull.returncode != 0:
+        return jsonify({"ok": False, "output": output})
+
+    changed = bool(before) and bool(after) and before != after
+    if changed:
+        threading.Thread(target=_delayed_restart, daemon=True).start()
+    return jsonify({"ok": True, "output": output, "restarting": changed})
 
 
 RECAP_MAX_DAYS = 30  # on ne remonte pas au-delà de la rétention du feed
@@ -764,6 +807,15 @@ PAGE = r"""<!doctype html><html lang="fr"><head>
      <button type="button" class="btn" onclick="closeSettings()">Fermer</button>
    </div>
   </form>
+  {% if auth_on %}
+  <label style="margin-top:16px">Mise à jour du serveur</label>
+  <div class="hint">Récupère la dernière version (<code>git pull</code>) puis redémarre Cardinal —
+    redémarrage seulement s'il y a du nouveau.</div>
+  <div class="form-actions">
+    <button type="button" class="btn" id="update-btn" onclick="updateApp()">⟳ Mettre à jour</button>
+  </div>
+  <pre id="update-out" style="white-space:pre-wrap;font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--muted);margin:8px 0 0;max-height:160px;overflow:auto;display:none"></pre>
+  {% endif %}
 </div></div>
 
 <!-- Overlay lecture du digest -->
@@ -840,6 +892,21 @@ document.getElementById('edit').addEventListener('click',e=>{if(e.target.id==='e
 // Réglages (modale)
 function openSettings(){document.getElementById('settings').classList.add('on');return false;}
 function closeSettings(){document.getElementById('settings').classList.remove('on');}
+async function updateApp(){
+ const btn=document.getElementById('update-btn'), out=document.getElementById('update-out');
+ btn.disabled=true; out.style.display='block'; out.textContent='Mise à jour…';
+ try{
+  const d=await (await fetch('/api/update',{method:'POST'})).json();
+  out.textContent=d.output||'(pas de sortie)';
+  if(d.restarting){
+   out.textContent+='\n\nNouveautés récupérées — redémarrage… la page va se recharger.';
+   setTimeout(()=>location.reload(), 5000);
+  }else{
+   if(d.ok) out.textContent+='\n\nDéjà à jour — pas de redémarrage.';
+   btn.disabled=false;
+  }
+ }catch(e){ out.textContent='Erreur : '+e; btn.disabled=false; }
+}
 document.getElementById('settings').addEventListener('click',e=>{if(e.target.id==='settings')closeSettings();});
 
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeEdit();closeDigest();closeSettings();}});

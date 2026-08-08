@@ -125,6 +125,12 @@ def _extract_json(text: str) -> dict:
 # limites "tokens par minute" des paliers gratuits (Groq : 12 000/min).
 MAX_LLM_ITEMS = 20
 
+# Les CVE sont volumineuses (description + CVSS + références). Envoyer 20 CVE d'un
+# coup fait exploser la limite "tokens par requête" de certains paliers gratuits
+# (Groq -> 413). On découpe donc en petits lots, chacun sous la limite, puis on
+# fusionne. Résultat : un gros sujet passe sur Groq comme les petits.
+CVE_BATCH = 6
+
 
 def _is_too_large(err) -> bool:
     """Vrai si l'erreur est un 413 / « requête trop grosse » (dépassement du
@@ -474,6 +480,25 @@ Réponds UNIQUEMENT par un objet JSON :
    "fix": "≥ 2.32.0", "sources": [{"title": "...", "url": "..."}]}]}"""
 
 
+def _summarize_cve_batches(system: str, since, vulns: list, item_keys: list) -> dict:
+    """Résume des CVE en les DÉCOUPANT en petits lots (CVE_BATCH) pour rester sous
+    la limite tokens/requête des paliers gratuits, puis fusionne les items. Le JSON
+    est envoyé COMPACT (sans indentation) : moins de tokens à traiter."""
+    since_str = since.strftime("%Y-%m-%d")
+    items, headline, summary = [], "", ""
+    for i in range(0, len(vulns), CVE_BATCH):
+        batch = vulns[i:i + CVE_BATCH]
+        user = (
+            f"Fenêtre : depuis {since_str}.\n"
+            f"CVE ({len(batch)}) :\n{json.dumps(batch, ensure_ascii=False)}"
+        )
+        part = _llm_json(system, user)
+        items.extend(part.get("items", []))
+        if not headline:  # on garde le titre/résumé du premier lot analysé
+            headline, summary = part.get("headline", ""), part.get("summary", "")
+    return {"headline": headline, "summary": summary, "items": items, "_item_keys": item_keys}
+
+
 def research_osv(topic) -> dict:
     since = _cve_since(topic)
     vulns = []
@@ -495,13 +520,7 @@ def research_osv(topic) -> dict:
             "items": [],
         }
 
-    user = (
-        f"Fenêtre : depuis {since.strftime('%Y-%m-%d')}.\n"
-        f"Vulnérabilités OSV :\n{json.dumps(vulns, ensure_ascii=False, indent=2)}"
-    )
-    digest = _llm_json(SYSTEM_OSV, user)
-    digest["_item_keys"] = [v["id"] for v in vulns]
-    return digest
+    return _summarize_cve_batches(SYSTEM_OSV, since, vulns, [v["id"] for v in vulns])
 
 
 # --------------------------------------------------------------------------
@@ -646,13 +665,7 @@ def research_nvd(topic) -> dict:
             "items": [],
         }
 
-    user = (
-        f"Fenêtre : depuis {since.strftime('%Y-%m-%d')}.\n"
-        f"CVE trouvées ({len(vulns)}) :\n{json.dumps(vulns, ensure_ascii=False, indent=2)}"
-    )
-    digest = _llm_json(SYSTEM_NVD, user)
-    digest["_item_keys"] = list(by_id.keys())
-    return digest
+    return _summarize_cve_batches(SYSTEM_NVD, since, vulns, list(by_id.keys()))
 
 
 # --------------------------------------------------------------------------
