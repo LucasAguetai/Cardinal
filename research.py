@@ -51,10 +51,10 @@ PROVIDERS = {
     },
     "openrouter": {
         "base_url": "https://openrouter.ai/api/v1",
-        # ⚠️ Les modèles ":free" d'OpenRouter changent souvent. Si tu as un 404
-        # "unavailable for free", change ce modèle via LLM_MODEL (voir la liste sur
-        # openrouter.ai/models?max_price=0).
-        "model": "inclusionai/ling-3.0-flash:free",
+        # "openrouter/free" : routeur auto qui choisit tout seul un modèle gratuit
+        # disponible (plus robuste que fixer un ":free" précis, qui change souvent).
+        # Surchargeable via LLM_MODEL / OPENROUTER_MODEL.
+        "model": "openrouter/free",
         "key_env": "OPENROUTER_API_KEY",
     },
 }

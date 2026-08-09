@@ -125,13 +125,17 @@ def _send_ntfy(title, body, click=None, priority="default", tags=None, server=No
 
 
 def _notify_new_high(topic, high_items):
-    """Push résumant les nouvelles CVE de priorité HAUTE ajoutées lors d'un run."""
+    """Push résumant les nouveautés de priorité HAUTE ajoutées lors d'un run.
+    Le libellé s'adapte à la source : « CVE » pour les sujets vulnérabilités
+    (OSV/NVD/KEV), « nouveauté » pour les sujets d'actu/RSS (ex. Sword Art Online)."""
     n = len(high_items)
+    suf = "s" if n > 1 else ""
+    noun = f"{n} CVE prioritaire{suf}" if topic.source in ("osv", "nvd", "kev") \
+        else f"{n} nouveauté{suf} prioritaire{suf}"
     lines = [f"• {it.get('title', '')}" for it in high_items[:5]]
     if n > 5:
         lines.append(f"… +{n - 5} autre(s)")
-    body = f"{topic.name}\n" + "\n".join(lines)
-    _send_ntfy(f"Cardinal: {n} CVE prioritaire(s)", body,
+    _send_ntfy(f"Cardinal · {topic.name} : {noun}", "\n".join(lines),
                click=f"{CARDINAL_URL}/feed/{topic.id}", priority="high", tags="rotating_light")
 
 
