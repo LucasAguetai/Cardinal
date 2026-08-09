@@ -39,10 +39,9 @@ def _cfg(key: str, default=None):
 PROVIDERS = {
     "gemini": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        # 2.0-flash : gratuit, stable, SANS phase de "raisonnement" — il renvoie
-        # donc toujours du contenu (les modèles 2.5 peuvent répondre vide en
-        # épuisant leur budget de tokens en réflexion). Surchargeable via LLM_MODEL.
-        "model": "gemini-2.0-flash",
+        # 2.5-flash : modèle gratuit actuel. (2.0-flash a été retiré côté Google →
+        # 404 NotFound.) Surchargeable via LLM_MODEL si Google le retire à son tour.
+        "model": "gemini-2.5-flash",
         "key_env": "GEMINI_API_KEY",
     },
     "groq": {
@@ -130,6 +129,10 @@ MAX_LLM_ITEMS = 20
 # (Groq -> 413). On découpe donc en petits lots, chacun sous la limite, puis on
 # fusionne. Résultat : un gros sujet passe sur Groq comme les petits.
 CVE_BATCH = 6
+
+# Pause entre deux lots de CVE : lisse les rafales d'appels LLM pour rester sous
+# la limite « requêtes par minute » des paliers gratuits (Gemini -> 429).
+CVE_BATCH_PAUSE_S = float(_cfg("CVE_BATCH_PAUSE", "2"))
 
 
 def _is_too_large(err) -> bool:
@@ -489,6 +492,8 @@ def _summarize_cve_batches(system: str, since, vulns: list, item_keys: list) -> 
     since_str = since.strftime("%Y-%m-%d")
     items, headline, summary = [], "", ""
     for i in range(0, len(vulns), CVE_BATCH):
+        if i and CVE_BATCH_PAUSE_S > 0:
+            time.sleep(CVE_BATCH_PAUSE_S)  # lisse les rafales -> moins de 429
         batch = vulns[i:i + CVE_BATCH]
         user = (
             f"Fenêtre : depuis {since_str}.\n"
