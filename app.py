@@ -15,6 +15,8 @@ import threading
 import subprocess
 import datetime as dt
 
+import requests
+
 from flask import (
     Flask, request, redirect, url_for, jsonify, send_from_directory,
     render_template_string, abort, session,
@@ -57,6 +59,8 @@ store.init_db()
 CARDINAL_PASSWORD = os.getenv("CARDINAL_PASSWORD")
 # Nom du service systemd à redémarrer depuis le bouton « Mettre à jour » (prod).
 SERVICE_NAME = os.getenv("CARDINAL_SERVICE", "cardinal")
+# URL publique (pour les liens cliquables dans les notifications push).
+CARDINAL_URL = os.getenv("CARDINAL_URL", "https://cardinal.aguetai.fr")
 # Clé de session stable (survit aux redémarrages) : env, sinon stockée en base.
 app.secret_key = os.getenv("CARDINAL_SECRET_KEY") or store.get_setting("SECRET_KEY")
 if not app.secret_key:
@@ -89,18 +93,66 @@ def _set_job(job_id, **data):
         JOBS[job_id] = {**JOBS.get(job_id, {}), **data}
 
 
+# --- Notifications push (ntfy.sh) -----------------------------------------
+def _ntfy_target():
+    topic = (store.get_setting("NTFY_TOPIC", "") or "").strip()
+    server = (store.get_setting("NTFY_SERVER", "") or "https://ntfy.sh").strip().rstrip("/")
+    return server, topic
+
+
+def _send_ntfy(title, body, click=None, priority="default", tags=None, server=None, topic=None):
+    """Envoie une notif push via ntfy. Titre/tags/lien restent ASCII (contrainte
+    des en-têtes HTTP) ; le corps porte le texte accentué (UTF-8). -> (ok, msg).
+    `topic`/`server` explicites (test avant enregistrement) ou lus des Réglages."""
+    if topic is None:
+        server, topic = _ntfy_target()
+    topic = (topic or "").strip()
+    server = (server or "https://ntfy.sh").strip().rstrip("/")
+    if not topic:
+        return False, "ntfy non configuré (topic vide dans Réglages)"
+    headers = {"Title": title, "Priority": priority}
+    if tags:
+        headers["Tags"] = tags
+    if click:
+        headers["Click"] = click
+    try:
+        r = requests.post(f"{server}/{topic}", data=body.encode("utf-8"),
+                          headers=headers, timeout=10)
+        r.raise_for_status()
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
+
+
+def _notify_new_high(topic, high_items):
+    """Push résumant les nouvelles CVE de priorité HAUTE ajoutées lors d'un run."""
+    n = len(high_items)
+    lines = [f"• {it.get('title', '')}" for it in high_items[:5]]
+    if n > 5:
+        lines.append(f"… +{n - 5} autre(s)")
+    body = f"{topic.name}\n" + "\n".join(lines)
+    _send_ntfy(f"Cardinal: {n} CVE prioritaire(s)", body,
+               click=f"{CARDINAL_URL}/feed/{topic.id}", priority="high", tags="rotating_light")
+
+
 def _core_run(topic) -> int:
     """Exécute une veille et l'empile dans le feed. Partagé par le bouton
     « Lancer » et le scheduler. Renvoie le nombre de nouveaux items."""
     digest = research.research(topic)
     keys = digest.pop("_item_keys", None)
     items = digest.get("items", [])
-    added = store.add_feed_items(topic.id, items) if items else 0
+    new_items = store.add_feed_items(topic.id, items) if items else []
     if keys:
         store.mark_seen(topic.id, keys)
     store.save_run(topic.id, "", digest)   # garde l'horodatage du dernier run
     store.purge_feed()                     # fenêtre glissante : retire ce qui a > 1 mois
-    return added
+    highs = [it for it in new_items if it.get("importance") == "high"]
+    if highs:
+        try:
+            _notify_new_high(topic, highs)     # push : seulement les nouveautés prioritaires
+        except Exception as e:
+            print(f"[notify] échec : {e}")
+    return len(new_items)
 
 
 def _run_job(job_id, topic_id):
@@ -254,6 +306,8 @@ def index():
         or_model=research._cfg("OPENROUTER_MODEL", "") or "",
         or_model_default=research.PROVIDERS["openrouter"]["model"],
         has_nvd=bool(store.get_setting("NVD_API_KEY") or os.getenv("NVD_API_KEY")),
+        ntfy_topic=store.get_setting("NTFY_TOPIC", "") or "",
+        ntfy_server=store.get_setting("NTFY_SERVER", "") or "",
     )
 
 
@@ -321,7 +375,20 @@ def save_settings():
     store.set_setting("OPENROUTER_MODEL", (f.get("openrouter_model") or "").strip())
     # Veille automatique globale (case cochée = "on").
     store.set_setting("SCHEDULER_ENABLED", "1" if f.get("scheduler") else "0")
+    # Notifications push ntfy (topic vide = désactivé ; serveur vide = ntfy.sh).
+    store.set_setting("NTFY_TOPIC", (f.get("ntfy_topic") or "").strip())
+    store.set_setting("NTFY_SERVER", (f.get("ntfy_server") or "").strip())
     return redirect(url_for("index"))
+
+
+@app.route("/api/notify-test", methods=["POST"])
+def api_notify_test():
+    data = request.get_json(silent=True) or {}
+    ok, msg = _send_ntfy(
+        "Cardinal: test", "Notification de test — si tu reçois ceci, c'est bon !",
+        click=CARDINAL_URL, priority="default", tags="white_check_mark",
+        topic=(data.get("topic") or None), server=(data.get("server") or None))
+    return jsonify({"ok": ok, "msg": msg})
 
 
 @app.route("/api/run/<tid>", methods=["POST"])
@@ -822,6 +889,20 @@ PAGE = r"""<!doctype html><html lang="fr"><head>
    <div class="hint">Interrupteur global. Chaque sujet a aussi son bouton ▶/⏸.
      Cardinal doit rester ouvert (le terminal aussi) pour que ça tourne.</div>
 
+   <label style="margin-top:14px">Notifications push (ntfy.sh)</label>
+   <div class="hint">Alerte sur ton téléphone quand une <b>CVE priorité haute</b> tombe, même site fermé.
+     Installe l'app <b>ntfy</b>, abonne-toi à un « topic » au nom secret, et remets ce même topic ici.</div>
+   <div class="two">
+    <div><label>Topic ntfy {% if ntfy_topic %}<span class="hint">(actif ✓)</span>{% endif %}</label>
+     <input name="ntfy_topic" value="{{ntfy_topic}}" placeholder="ex: cardinal-a7f3k9-secret" autocomplete="off"></div>
+    <div><label>Serveur <span class="hint">(vide = ntfy.sh)</span></label>
+     <input name="ntfy_server" value="{{ntfy_server}}" placeholder="https://ntfy.sh" autocomplete="off"></div>
+   </div>
+   <div class="form-actions" style="margin-top:8px">
+     <button type="button" class="btn" onclick="testNotify()">🔔 Tester la notif</button>
+     <span id="notify-out" class="hint"></span>
+   </div>
+
    <div class="form-actions">
      <button class="btn-go" type="submit">Enregistrer</button>
      <button type="button" class="btn" onclick="closeSettings()">Fermer</button>
@@ -928,6 +1009,17 @@ async function updateApp(){
    btn.disabled=false;
   }
  }catch(e){ out.textContent='Erreur : '+e; btn.disabled=false; }
+}
+async function testNotify(){
+ const out=document.getElementById('notify-out');
+ const topic=document.querySelector('#settings [name=ntfy_topic]').value.trim();
+ const server=document.querySelector('#settings [name=ntfy_server]').value.trim();
+ if(!topic){ out.textContent='Renseigne un topic d\'abord.'; return; }
+ out.textContent='Envoi…';
+ try{
+  const d=await (await fetch('/api/notify-test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({topic,server})})).json();
+  out.textContent=d.ok?'✅ Envoyée — regarde ton téléphone.':('❌ '+(d.msg||'échec'));
+ }catch(e){ out.textContent='❌ '+e; }
 }
 document.getElementById('settings').addEventListener('click',e=>{if(e.target.id==='settings')closeSettings();});
 

@@ -189,11 +189,12 @@ def _feed_key(item: dict) -> str:
     return hashlib.sha1(base.encode("utf-8")).hexdigest()
 
 
-def add_feed_items(topic_id: str, items: list) -> int:
-    """Empile les items d'un digest dans le feed. Renvoie le nombre RÉELLEMENT
-    ajoutés (les doublons sont ignorés)."""
+def add_feed_items(topic_id: str, items: list) -> list:
+    """Empile les items d'un digest dans le feed. Renvoie la LISTE des items
+    RÉELLEMENT ajoutés (les doublons sont ignorés) — utile pour notifier sur les
+    seules nouveautés. `len(...)` donne le compte."""
     now = dt.datetime.now(dt.timezone.utc).isoformat()
-    added = 0
+    added = []
     with _conn() as c:
         for it in items:
             cur = c.execute(
@@ -204,7 +205,8 @@ def add_feed_items(topic_id: str, items: list) -> int:
                  it.get("importance", "low"), it.get("fix", ""),
                  json.dumps(it.get("sources", []), ensure_ascii=False), now),
             )
-            added += cur.rowcount
+            if cur.rowcount:
+                added.append(it)
     return added
 
 

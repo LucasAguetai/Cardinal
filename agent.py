@@ -43,7 +43,7 @@ def cmd_run(topic_id: str):
     # déjà vues est faite en amont dans research), puis on mémorise les clés vues.
     keys = digest.pop("_item_keys", None)
     items = digest.get("items", [])
-    added = store.add_feed_items(topic.id, items) if items else 0
+    added = len(store.add_feed_items(topic.id, items)) if items else 0
     if keys:
         store.mark_seen(topic.id, keys)
     store.purge_feed()  # fenêtre glissante : retire ce qui a plus d'un mois

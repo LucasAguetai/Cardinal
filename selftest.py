@@ -109,8 +109,8 @@ def t_feed():
         c.execute("DELETE FROM feed_items WHERE topic_id=?", (t.id,))
     items = [{"title": "Item A", "body": "b", "importance": "high", "fix": "≥ 2.32.0",
               "sources": [{"title": "s", "url": "https://e.com"}]}]
-    n1 = store.add_feed_items(t.id, items)
-    n2 = store.add_feed_items(t.id, items)          # même contenu -> ignoré
+    n1 = len(store.add_feed_items(t.id, items))
+    n2 = len(store.add_feed_items(t.id, items))     # même contenu -> ignoré
     assert n1 == 1 and n2 == 0, f"dédup KO ({n1},{n2})"
 
     feed = store.get_feed(t.id)
@@ -122,7 +122,7 @@ def t_feed():
     # Dédup par URL : le même lien reformulé (titre différent) NE crée PAS de doublon.
     reworded = [{"title": "Item A — autre formulation", "body": "b2", "importance": "low",
                  "sources": [{"title": "s", "url": "https://e.com"}]}]
-    assert store.add_feed_items(t.id, reworded) == 0, "dédup par URL KO"
+    assert len(store.add_feed_items(t.id, reworded)) == 0, "dédup par URL KO"
     assert len(store.get_feed(t.id)) == 1
 
     # Un item vieux de 40 j doit disparaître à la purge ; le récent reste.
