@@ -492,7 +492,7 @@ def feed(tid):
         abort(404)
     items = store.get_feed(tid)
     store.mark_read(tid)   # ouvrir le feed = tout marquer comme lu
-    return render.render_feed(topic, items)
+    return render.render_feed(topic, items, has_run=bool(store.latest_run(tid)))
 
 
 @app.route("/digests/<path:filename>")

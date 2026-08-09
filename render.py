@@ -181,8 +181,10 @@ def _feed_item_html(row: dict) -> str:
     </article>"""
 
 
-def render_feed(topic, items: list, days: int = 30) -> str:
-    """Page autonome : le feed continu d'un sujet, groupé par jour."""
+def render_feed(topic, items: list, days: int = 30, has_run: bool = True) -> str:
+    """Page autonome : le feed continu d'un sujet, groupé par jour.
+    `has_run` : le sujet a-t-il déjà été lancé au moins une fois ? (adapte le
+    message quand le feed est vide : « lance une veille » vs « rien trouvé »)."""
     now = _now()
 
     blocks, current_day = [], None
@@ -196,10 +198,18 @@ def render_feed(topic, items: list, days: int = 30) -> str:
             blocks.append(f'<div class="day">{label}</div>')
         blocks.append(_feed_item_html(row))
 
-    body = "".join(blocks) if items else (
-        '<p class="empty">Le feed est encore vide. Lance une veille : '
-        'les résultats s\'empileront ici et resteront visibles pendant un mois.</p>'
-    )
+    if items:
+        body = "".join(blocks)
+    elif not has_run:
+        body = ('<p class="empty">Le feed est encore vide. Lance une veille : '
+                'les résultats s\'empileront ici et resteront visibles pendant un mois.</p>')
+    elif topic.source == "kev":
+        body = ('<p class="empty">✅ Aucune CVE activement exploitée sur tes produits — '
+                'c\'est bon signe. Cardinal surveille en continu et affichera ici, en '
+                'priorité, toute CVE de tes technos visée par une attaque connue.</p>')
+    else:
+        body = ('<p class="empty">Rien de neuf pour l\'instant. Cardinal continue de '
+                'surveiller — les nouveautés apparaîtront ici automatiquement.</p>')
 
     return f"""<!doctype html>
 <html lang="fr">
