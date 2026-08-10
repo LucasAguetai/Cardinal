@@ -100,9 +100,13 @@ def _ntfy_target():
     return server, topic
 
 
+_NTFY_PRIO = {"min": 1, "low": 2, "default": 3, "high": 4, "max": 5, "urgent": 5}
+
+
 def _send_ntfy(title, body, click=None, priority="default", tags=None, server=None, topic=None):
-    """Envoie une notif push via ntfy. Titre/tags/lien restent ASCII (contrainte
-    des en-têtes HTTP) ; le corps porte le texte accentué (UTF-8). -> (ok, msg).
+    """Envoie une notif push via ntfy en publiant du JSON (corps UTF-8) : le titre
+    ET le corps peuvent donc porter des accents/caractères non-ASCII (les en-têtes
+    HTTP, eux, ne gèrent pas l'UTF-8 → titres en « � »). -> (ok, msg).
     `topic`/`server` explicites (test avant enregistrement) ou lus des Réglages."""
     if topic is None:
         server, topic = _ntfy_target()
@@ -110,14 +114,14 @@ def _send_ntfy(title, body, click=None, priority="default", tags=None, server=No
     server = (server or "https://ntfy.sh").strip().rstrip("/")
     if not topic:
         return False, "ntfy non configuré (topic vide dans Réglages)"
-    headers = {"Title": title, "Priority": priority}
+    payload = {"topic": topic, "title": title, "message": body,
+               "priority": _NTFY_PRIO.get(priority, 3)}
     if tags:
-        headers["Tags"] = tags
+        payload["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
     if click:
-        headers["Click"] = click
+        payload["click"] = click
     try:
-        r = requests.post(f"{server}/{topic}", data=body.encode("utf-8"),
-                          headers=headers, timeout=10)
+        r = requests.post(server, json=payload, timeout=10)  # POST racine + JSON
         r.raise_for_status()
         return True, "ok"
     except Exception as e:
