@@ -17,6 +17,12 @@ import research
 import render
 import store
 
+# Sécurité : le self-test tourne sur une base JETABLE, jamais sur cardinal.db (live).
+store.DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_selftest.db")
+os.environ["CARDINAL_DB"] = store.DB_PATH   # pour que `import app` vise la même base
+if os.path.exists(store.DB_PATH):
+    os.remove(store.DB_PATH)
+
 PASS, FAIL = "\033[92mOK\033[0m", "\033[91mÉCHEC\033[0m"
 results = []
 
@@ -294,6 +300,101 @@ def t_unread():
     assert store.unread_count(tid) == 1, "1 nouveau non lu après un run"
 
 
+# 13) Multi-utilisateurs : isolation des espaces, réglages par-user, invitations.
+def t_accounts():
+    from topics import Topic
+    store.init_db()
+    with store._conn() as c:
+        for tb in ("users", "credentials", "invites"):
+            c.execute(f"DELETE FROM {tb}")
+        c.execute("DELETE FROM topics WHERE id IN ('a_top','b_top')")
+    a = store.create_user("A", "Alice", True)
+    b = store.create_user("B", "Bob", False)
+    assert a["is_admin"] == 1 and b["is_admin"] == 0
+    store.upsert_topic(Topic(id="a_top", name="A", source="web", frequency_hours=24,
+                             feeds=["x"], owner_id="A"))
+    store.upsert_topic(Topic(id="b_top", name="B", source="web", frequency_hours=24,
+                             feeds=["y"], owner_id="B"))
+    # Isolation : Alice ne voit/atteint pas le sujet de Bob.
+    assert [t.id for t in store.list_topics("A")] == ["a_top"]
+    assert store.get_topic("b_top", "B").owner_id == "B"
+    try:
+        store.get_topic("b_top", "A"); raise AssertionError("isolation KO")
+    except KeyError:
+        pass
+    # Réglages par-utilisateur (clés perso, cloisonnées).
+    store.set_user_setting("A", "GEMINI_API_KEY", "KA")
+    store.set_user_setting("B", "GEMINI_API_KEY", "KB")
+    assert store.get_user_setting("A", "GEMINI_API_KEY") == "KA"
+    assert store.get_user_setting("B", "GEMINI_API_KEY") == "KB"
+    # Invitations : usage unique.
+    store.create_invite("tok", "A", "test")
+    assert store.invite_is_valid("tok")
+    store.consume_invite("tok", "B")
+    assert not store.invite_is_valid("tok")
+    # Passkeys : stockage + mise à jour du compteur anti-rejeu.
+    store.add_credential("cred", "A", b"PUB", 0, "internal")
+    assert store.get_credential("cred")["user_id"] == "A"
+    store.update_sign_count("cred", 7)
+    assert store.get_credential("cred")["sign_count"] == 7
+    # Suppression d'un compte = suppression de son espace.
+    store.delete_user("B")
+    assert store.get_user("B") is None and store.list_topics("B") == []
+
+
+# 14) Reprise du legacy : les sujets sans propriétaire reviennent au 1er admin.
+def t_claim_legacy():
+    from topics import Topic
+    store.init_db()
+    with store._conn() as c:
+        c.execute("DELETE FROM topics")
+        c.execute("DELETE FROM users")
+    store.upsert_topic(Topic(id="legacy1", name="L", source="web",
+                             frequency_hours=24, feeds=["x"]))  # owner_id None
+    store.create_user("ADM", "Admin", True)
+    n = store.claim_legacy("ADM")
+    assert n >= 1 and store.get_topic("legacy1", "ADM").owner_id == "ADM"
+
+
+# 15) Clés par-utilisateur pendant un run : research._cfg lit le getter contextuel
+#     (chaque sujet tourne avec la clé de SON propriétaire), sinon repli global.
+def t_user_keys_context():
+    assert research._cfg("MISSING_XYZ", "def") == "def"
+    token = research.set_settings_getter(
+        lambda k, d=None: {"GEMINI_API_KEY": "USERKEY"}.get(k))
+    try:
+        assert research._cfg("GEMINI_API_KEY") == "USERKEY"
+        assert research._cfg("AUTRE", "d") == "d"   # pas de repli global en contexte user
+    finally:
+        research.reset_settings_getter(token)
+    # Hors contexte : repli global/env.
+    store.set_setting("GEMINI_API_KEY", "GLOBALKEY")
+    assert research._cfg("GEMINI_API_KEY") == "GLOBALKEY"
+
+
+# 16) Rôle admin : le décorateur @admin_required renvoie 403 à un non-admin.
+def t_admin_required():
+    import app
+    from flask import session
+    store.init_db()
+    with store._conn() as c:
+        c.execute("DELETE FROM users")
+    store.create_user("ADM", "Admin", True)
+    store.create_user("USR", "User", False)
+
+    @app.admin_required
+    def _protected():
+        return "ok"
+
+    with app.app.test_request_context("/"):
+        session["uid"] = "USR"
+        r = _protected()
+        assert isinstance(r, tuple) and r[1] == 403, "un non-admin devrait recevoir 403"
+    with app.app.test_request_context("/"):
+        session["uid"] = "ADM"
+        assert _protected() == "ok", "l'admin devrait passer"
+
+
 print("Cardinal — self-test (hors-ligne)\n")
 check("Chargement des sujets", t_topics)
 check("Parsing RSS + fenêtre + nettoyage HTML", t_rss)
@@ -308,9 +409,13 @@ check("Décodage du 429 (par minute / par jour)", t_quota_hint)
 check("Scheduler (activation + logique 'est dû')", t_scheduler)
 check("Actu auto (Google News, sans lien)", t_news)
 check("Notifications (compteur non lus)", t_unread)
+check("Comptes : isolation + réglages perso + invitations", t_accounts)
+check("Reprise du legacy (sujets → 1er admin)", t_claim_legacy)
+check("Clés par-utilisateur (contexte de run)", t_user_keys_context)
+check("Rôle admin (@admin_required → 403)", t_admin_required)
 
 # nettoyage
-for f in ("cardinal.db",):
+for f in (store.DB_PATH,):
     if os.path.exists(f):
         os.remove(f)
 

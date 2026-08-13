@@ -19,6 +19,7 @@ class Topic:
     packages: list = field(default_factory=list)  # source="osv" : paquets surveillés
     keywords: list = field(default_factory=list)  # source="nvd" : produits (mots-clés)
     min_severity: str = ""       # source="nvd" : "" | LOW | MEDIUM | HIGH | CRITICAL
+    owner_id: str = None         # propriétaire du sujet (multi-utilisateurs) ; None = legacy
 
 
 # --- Tes sujets ------------------------------------------------------------

@@ -16,6 +16,7 @@ import re
 import json
 import time
 import calendar
+import contextvars
 import datetime as dt
 
 import requests
@@ -27,8 +28,33 @@ from openai import (
 import store  # pour lire les réglages (fournisseur, clés) saisis dans le dashboard
 
 
+# Réglages de l'utilisateur courant (multi-utilisateurs). Posé par app._core_run
+# le temps d'un run : chaque sujet tourne alors avec les CLÉS DE SON PROPRIÉTAIRE.
+# Non posé (local / mono-utilisateur) → on retombe sur les réglages globaux + env.
+_settings_getter = contextvars.ContextVar("cardinal_settings_getter", default=None)
+
+
+def set_settings_getter(getter):
+    """Active un résolveur de réglages par-utilisateur. Renvoie un token à repasser
+    à reset_settings_getter() (motif contextvars, sûr en multi-thread)."""
+    return _settings_getter.set(getter)
+
+
+def reset_settings_getter(token):
+    _settings_getter.reset(token)
+
+
 def _cfg(key: str, default=None):
-    """Réglage : d'abord le dashboard (SQLite), sinon l'environnement (.env), sinon défaut."""
+    """Réglage. En contexte utilisateur (getter posé) : on lit UNIQUEMENT ses
+    réglages perso — pas de repli global/env, pour qu'un invité n'emprunte jamais la
+    clé/quota d'un autre. Sinon : dashboard global (SQLite) puis .env, sinon défaut."""
+    getter = _settings_getter.get()
+    if getter is not None:
+        try:
+            v = getter(key)
+        except Exception:
+            v = None
+        return v or default
     try:
         v = store.get_setting(key)
     except Exception:

@@ -11,21 +11,24 @@ lire le digest. La clé LLM se colle dans "Réglages" (ou reste dans .env).
 import os
 import time
 import uuid
+import secrets
 import threading
 import subprocess
 import datetime as dt
+from functools import wraps
 
 import requests
 
 from flask import (
     Flask, request, redirect, url_for, jsonify, send_from_directory,
-    render_template_string, abort, session,
+    render_template_string, abort, session, Response,
 )
 from dotenv import load_dotenv
 
 import store
 import research
 import render
+import auth
 from topics import Topic
 
 load_dotenv()
@@ -34,8 +37,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DIGESTS_DIR = os.path.join(BASE_DIR, "digests")
 os.makedirs(DIGESTS_DIR, exist_ok=True)
 
-# Chemins absolus -> l'appli tourne quel que soit le dossier courant
-store.DB_PATH = os.path.join(BASE_DIR, "cardinal.db")
+# Chemins absolus -> l'appli tourne quel que soit le dossier courant.
+# CARDINAL_DB permet de pointer une base alternative (utilisé par le self-test).
+store.DB_PATH = os.getenv("CARDINAL_DB") or os.path.join(BASE_DIR, "cardinal.db")
 
 # Fuseau d'affichage explicite (sinon .astimezone() suit le fuseau serveur, souvent
 # UTC en prod -> heures décalées). Configurable via CARDINAL_TZ. Défaut : Europe/Paris.
@@ -53,10 +57,12 @@ def _to_local(d: dt.datetime) -> dt.datetime:
 app = Flask(__name__)
 store.init_db()
 
-# --- Authentification (activée SEULEMENT si un mot de passe est défini) ----
-# En local, sans CARDINAL_PASSWORD, aucun login n'est demandé. En production,
-# on met CARDINAL_PASSWORD=... pour protéger l'accès (et donc tes clés/quotas).
-CARDINAL_PASSWORD = os.getenv("CARDINAL_PASSWORD")
+# --- Comptes & authentification (passkeys WebAuthn) ------------------------
+# Chaque personne a son compte + ses passkeys + son espace (sujets/feed/clés).
+# Le PREMIER compte créé est l'admin. Sur l'URL publique, ce premier
+# enregistrement exige CARDINAL_PASSWORD comme « code d'amorçage » (empêche un
+# inconnu de rafler l'admin). Ensuite, l'admin invite les autres (lien d'invitation).
+CARDINAL_PASSWORD = os.getenv("CARDINAL_PASSWORD")  # code d'amorçage du 1er admin
 # Nom du service systemd à redémarrer depuis le bouton « Mettre à jour » (prod).
 SERVICE_NAME = os.getenv("CARDINAL_SERVICE", "cardinal")
 # URL publique (pour les liens cliquables dans les notifications push).
@@ -68,17 +74,45 @@ if not app.secret_key:
     store.set_setting("SECRET_KEY", app.secret_key)
 app.permanent_session_lifetime = dt.timedelta(days=30)
 
+# Chemins publics (pas de session requise).
+_PUBLIC_EXACT = {"/login", "/register", "/healthz"}
+
 
 @app.before_request
 def _require_login():
-    if not CARDINAL_PASSWORD or session.get("auth"):
-        return  # mode local ouvert, ou déjà connecté
     p = request.path
-    if p == "/login" or p == "/healthz" or p.startswith("/img/"):
+    if p in _PUBLIC_EXACT or p.startswith("/webauthn/") or p.startswith("/img/"):
+        return
+    if session.get("uid") and store.get_user(session["uid"]):
         return
     if p.startswith("/api/"):
         return ("Non authentifié", 401)
     return redirect(url_for("login"))
+
+
+# --- Helpers session / rôles ----------------------------------------------
+def current_uid():
+    return session.get("uid")
+
+
+def current_user():
+    uid = session.get("uid")
+    return store.get_user(uid) if uid else None
+
+
+def _is_admin() -> bool:
+    u = current_user()
+    return bool(u and u["is_admin"])
+
+
+def admin_required(fn):
+    """Réserve une route à l'admin (ntfy, mise à jour serveur, gestion des comptes)."""
+    @wraps(fn)
+    def _w(*a, **k):
+        if not _is_admin():
+            return ("Réservé à l'administrateur.", 403)
+        return fn(*a, **k)
+    return _w
 
 # --- Jobs en tâche de fond (mémoire) --------------------------------------
 JOBS = {}
@@ -145,8 +179,17 @@ def _notify_new_high(topic, high_items):
 
 def _core_run(topic) -> int:
     """Exécute une veille et l'empile dans le feed. Partagé par le bouton
-    « Lancer » et le scheduler. Renvoie le nombre de nouveaux items."""
-    digest = research.research(topic)
+    « Lancer » et le scheduler. Renvoie le nombre de nouveaux items.
+    Le sujet tourne avec les CLÉS DE SON PROPRIÉTAIRE (multi-utilisateurs)."""
+    token = None
+    if topic.owner_id:  # contexte utilisateur : research lit les clés de ce compte
+        token = research.set_settings_getter(
+            lambda k, d=None: store.get_user_setting(topic.owner_id, k, d))
+    try:
+        digest = research.research(topic)
+    finally:
+        if token is not None:
+            research.reset_settings_getter(token)
     keys = digest.pop("_item_keys", None)
     items = digest.get("items", [])
     new_items = store.add_feed_items(topic.id, items) if items else []
@@ -154,8 +197,11 @@ def _core_run(topic) -> int:
         store.mark_seen(topic.id, keys)
     store.save_run(topic.id, "", digest)   # garde l'horodatage du dernier run
     store.purge_feed()                     # fenêtre glissante : retire ce qui a > 1 mois
+    # Push ntfy : réservé à l'admin (ntfy est admin-only) → pas de fuite des titres
+    # d'autres utilisateurs vers son téléphone.
     highs = [it for it in new_items if it.get("importance") == "high"]
-    if highs:
+    owner = store.get_user(topic.owner_id) if topic.owner_id else None
+    if highs and owner and owner["is_admin"]:
         try:
             _notify_new_high(topic, highs)     # push : seulement les nouveautés prioritaires
         except Exception as e:
@@ -163,9 +209,9 @@ def _core_run(topic) -> int:
     return len(new_items)
 
 
-def _run_job(job_id, topic_id):
+def _run_job(job_id, topic_id, owner_id=None):
     try:
-        topic = store.get_topic(topic_id)
+        topic = store.get_topic(topic_id, owner_id)  # 404/KeyError si pas à ce user
         with RUN_LOCK:
             added = _core_run(topic)
         _set_job(job_id, status="done", added=added,
@@ -288,7 +334,9 @@ def _parse_config(source, text, min_severity=""):
 # --- Routes ---------------------------------------------------------------
 @app.route("/")
 def index():
-    topics = store.list_topics()
+    uid = current_uid()
+    admin = _is_admin()
+    topics = store.list_topics(uid)          # seulement MES sujets
     sched_on = store.get_setting("SCHEDULER_ENABLED", "1") == "1"
     cards = []
     for t in topics:
@@ -305,18 +353,28 @@ def index():
             "enabled": enabled,
             "next_ts": _next_run_ts(t) if (enabled and sched_on) else None,
         })
-    provider = store.get_setting("LLM_PROVIDER", os.getenv("LLM_PROVIDER", "gemini"))
-    # Une clé par fournisseur : sert au basculement automatique en cas de quota.
-    keys = {p: bool(research._provider_key(p)) for p in research.PROVIDERS}
+    provider = store.get_user_setting(uid, "LLM_PROVIDER", "gemini")
+    # Une clé par fournisseur (les MIENNES) : sert au basculement auto en cas de quota.
+    keys = {p: bool(store.get_user_setting(uid, cfg["key_env"]))
+            for p, cfg in research.PROVIDERS.items()}
     return render_template_string(
         PAGE, cards=cards, provider=provider, keys=keys, has_key=any(keys.values()),
-        sched_on=sched_on, auth_on=bool(CARDINAL_PASSWORD),
-        or_model=research._cfg("OPENROUTER_MODEL", "") or "",
+        sched_on=sched_on, is_admin=admin, user_name=(current_user() or {}).get("name", ""),
+        or_model=store.get_user_setting(uid, "OPENROUTER_MODEL", "") or "",
         or_model_default=research.PROVIDERS["openrouter"]["model"],
-        has_nvd=bool(store.get_setting("NVD_API_KEY") or os.getenv("NVD_API_KEY")),
-        ntfy_topic=store.get_setting("NTFY_TOPIC", "") or "",
-        ntfy_server=store.get_setting("NTFY_SERVER", "") or "",
+        has_nvd=bool(store.get_user_setting(uid, "NVD_API_KEY")),
+        ntfy_topic=(store.get_setting("NTFY_TOPIC", "") or "") if admin else "",
+        ntfy_server=(store.get_setting("NTFY_SERVER", "") or "") if admin else "",
+        users=(store.list_users() if admin else []),
     )
+
+
+def _owns_or_redirect(tid):
+    """Renvoie le sujet s'il appartient à l'utilisateur courant, sinon None."""
+    try:
+        return store.get_topic(tid, current_uid())
+    except KeyError:
+        return None
 
 
 @app.route("/topics/add", methods=["POST"])
@@ -325,12 +383,18 @@ def add_topic():
     tid = (f.get("id") or "").strip().lower().replace(" ", "-")
     if not tid or not f.get("name"):
         return redirect(url_for("index"))
+    # L'id de sujet est un PK global : on le rend unique dans toute l'instance
+    # (jamais écraser le sujet d'un autre utilisateur).
+    base, i = tid, 2
+    while not store.topic_id_available(tid):
+        tid = f"{base}-{i}"; i += 1
     cfg = _parse_config(f.get("source"), f.get("config"), f.get("min_severity"))
     t = Topic(
         id=tid, name=f.get("name").strip(), source=f.get("source"),
         frequency_hours=int(f.get("frequency_hours") or 24),
         feeds=cfg["feeds"], packages=cfg["packages"],
         keywords=cfg["keywords"], min_severity=cfg["min_severity"],
+        owner_id=current_uid(),
     )
     store.upsert_topic(t)
     return redirect(url_for("index"))
@@ -339,6 +403,8 @@ def add_topic():
 @app.route("/topics/<tid>/edit", methods=["POST"])
 def edit_topic(tid):
     """Met à jour un sujet existant (l'identifiant reste figé)."""
+    if not _owns_or_redirect(tid):
+        return redirect(url_for("index"))
     f = request.form
     name = (f.get("name") or "").strip()
     source = f.get("source")
@@ -350,6 +416,7 @@ def edit_topic(tid):
         frequency_hours=int(f.get("frequency_hours") or 24),
         feeds=cfg["feeds"], packages=cfg["packages"],
         keywords=cfg["keywords"], min_severity=cfg["min_severity"],
+        owner_id=current_uid(),
     )
     store.upsert_topic(t)
     return redirect(url_for("index"))
@@ -357,39 +424,42 @@ def edit_topic(tid):
 
 @app.route("/topics/<tid>/delete", methods=["POST"])
 def delete_topic(tid):
-    store.delete_topic(tid)
+    if _owns_or_redirect(tid):
+        store.delete_topic(tid)
     return redirect(url_for("index"))
 
 
 @app.route("/topics/<tid>/toggle", methods=["POST"])
 def toggle_topic(tid):
     """Active / met en pause la veille automatique d'un sujet."""
-    store.set_enabled(tid, not store.is_enabled(tid))
+    if _owns_or_redirect(tid):
+        store.set_enabled(tid, not store.is_enabled(tid))
     return redirect(url_for("index"))
 
 
 @app.route("/settings", methods=["POST"])
 def save_settings():
     f = request.form
-    store.set_setting("LLM_PROVIDER", f.get("provider", "gemini"))
-    # Une clé par fournisseur (on n'écrase jamais avec du vide).
+    uid = current_uid()
+    # Réglages PAR UTILISATEUR : provider, clés, modèle, NVD (chacun les siens).
+    store.set_user_setting(uid, "LLM_PROVIDER", f.get("provider", "gemini"))
     for p, cfg in research.PROVIDERS.items():
         val = (f.get(p + "_key") or "").strip()
-        if val:
-            store.set_setting(cfg["key_env"], val)
+        if val:  # on n'écrase jamais avec du vide
+            store.set_user_setting(uid, cfg["key_env"], val)
     if f.get("nvd_key"):
-        store.set_setting("NVD_API_KEY", f.get("nvd_key").strip())
-    # Modèle OpenRouter (les modèles gratuits changent ; vide = défaut).
-    store.set_setting("OPENROUTER_MODEL", (f.get("openrouter_model") or "").strip())
-    # Veille automatique globale (case cochée = "on").
-    store.set_setting("SCHEDULER_ENABLED", "1" if f.get("scheduler") else "0")
-    # Notifications push ntfy (topic vide = désactivé ; serveur vide = ntfy.sh).
-    store.set_setting("NTFY_TOPIC", (f.get("ntfy_topic") or "").strip())
-    store.set_setting("NTFY_SERVER", (f.get("ntfy_server") or "").strip())
+        store.set_user_setting(uid, "NVD_API_KEY", f.get("nvd_key").strip())
+    store.set_user_setting(uid, "OPENROUTER_MODEL", (f.get("openrouter_model") or "").strip())
+    # Réglages D'INSTANCE (admin uniquement) : scheduler global + notifications ntfy.
+    if _is_admin():
+        store.set_setting("SCHEDULER_ENABLED", "1" if f.get("scheduler") else "0")
+        store.set_setting("NTFY_TOPIC", (f.get("ntfy_topic") or "").strip())
+        store.set_setting("NTFY_SERVER", (f.get("ntfy_server") or "").strip())
     return redirect(url_for("index"))
 
 
 @app.route("/api/notify-test", methods=["POST"])
+@admin_required
 def api_notify_test():
     data = request.get_json(silent=True) or {}
     ok, msg = _send_ntfy(
@@ -401,9 +471,14 @@ def api_notify_test():
 
 @app.route("/api/run/<tid>", methods=["POST"])
 def api_run(tid):
+    try:
+        store.get_topic(tid, current_uid())   # 404 si le sujet n'est pas à moi
+    except KeyError:
+        return jsonify({"error": "inconnu"}), 404
     job_id = uuid.uuid4().hex
     _set_job(job_id, status="running")
-    threading.Thread(target=_run_job, args=(job_id, tid), daemon=True).start()
+    threading.Thread(target=_run_job, args=(job_id, tid, current_uid()),
+                     daemon=True).start()
     return jsonify({"job": job_id})
 
 
@@ -426,11 +501,9 @@ def _delayed_restart():
 
 
 @app.route("/api/update", methods=["POST"])
+@admin_required
 def api_update():
-    # Action puissante (git + restart en root) : on l'interdit tant qu'aucun mot
-    # de passe ne protège l'accès, pour qu'une instance ouverte ne soit pas pilotable.
-    if not CARDINAL_PASSWORD:
-        return jsonify({"ok": False, "output": "Indisponible : définis CARDINAL_PASSWORD."}), 403
+    # Action puissante (git + restart en root) : réservée à l'admin.
 
     def _git(*args):
         return subprocess.run(["git", *args], cwd=BASE_DIR, capture_output=True,
@@ -490,8 +563,8 @@ def api_recap(offset):
     """News d'un jour, regroupées par sujet (les sujets sans news ne sont pas listés)."""
     offset = max(0, min(offset, RECAP_MAX_DAYS))
     start, end, label = _day_range(offset)
-    rows = store.feed_items_between(start, end)
-    topics = {t.id: t for t in store.list_topics()}
+    rows = store.feed_items_between(start, end, current_uid())   # mon récap
+    topics = {t.id: t for t in store.list_topics(current_uid())}
 
     groups = {}
     for r in rows:
@@ -519,7 +592,7 @@ def api_dashboard():
     """État léger de chaque sujet, pour rafraîchir le dashboard sans recharger."""
     sched_on = store.get_setting("SCHEDULER_ENABLED", "1") == "1"
     out = {}
-    for t in store.list_topics():
+    for t in store.list_topics(current_uid()):
         enabled = store.is_enabled(t.id)
         out[t.id] = {
             "unread": store.unread_count(t.id),
@@ -534,24 +607,143 @@ def healthz():
     return "ok"
 
 
-@app.route("/login", methods=["GET", "POST"])
+@app.route("/login")
 def login():
-    if not CARDINAL_PASSWORD:
+    if session.get("uid") and store.get_user(session["uid"]):
         return redirect(url_for("index"))
-    error = ""
-    if request.method == "POST":
-        if (request.form.get("password") or "") == CARDINAL_PASSWORD:
-            session["auth"] = True
-            session.permanent = True
-            return redirect(url_for("index"))
-        error = "Mot de passe incorrect."
-    return render_template_string(LOGIN_PAGE, error=error)
+    if store.count_users() == 0:            # aucun compte encore → amorçage
+        return redirect(url_for("register"))
+    return render_template_string(LOGIN_PAGE)
+
+
+@app.route("/register")
+def register():
+    if session.get("uid") and store.get_user(session["uid"]):
+        return redirect(url_for("index"))
+    bootstrap = store.count_users() == 0
+    invite = (request.args.get("invite") or "").strip()
+    if not bootstrap and not store.invite_is_valid(invite):
+        return render_template_string(REGISTER_PAGE, error=(
+            "Invitation invalide ou déjà utilisée. Demande un nouveau lien à l'admin."),
+            bootstrap=False, need_code=False, invite="")
+    # Amorçage : code requis seulement si CARDINAL_PASSWORD est défini (prod).
+    need_code = bootstrap and bool(CARDINAL_PASSWORD)
+    return render_template_string(REGISTER_PAGE, error="", bootstrap=bootstrap,
+                                  need_code=need_code, invite=invite)
 
 
 @app.route("/logout")
 def logout():
     session.clear()
     return redirect(url_for("login"))
+
+
+# --- WebAuthn : enregistrement d'une passkey (création de compte) ----------
+@app.route("/webauthn/register/options", methods=["POST"])
+def wa_register_options():
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return ("Nom requis.", 400)
+    bootstrap = store.count_users() == 0
+    if bootstrap:
+        if CARDINAL_PASSWORD and (data.get("code") or "") != CARDINAL_PASSWORD:
+            return ("Code d'amorçage incorrect.", 403)
+        is_admin = True
+        invite = None
+    else:
+        invite = (data.get("invite") or "").strip()
+        if not store.invite_is_valid(invite):
+            return ("Invitation invalide.", 403)
+        is_admin = False
+    uid = uuid.uuid4().hex
+    opts_json, challenge = auth.registration_options(uid.encode("utf-8"), name)
+    # On mémorise le contexte d'inscription le temps de la cérémonie.
+    session["reg"] = {"uid": uid, "name": name, "admin": is_admin,
+                      "invite": invite, "chal": auth.to_b64url(challenge)}
+    return Response(opts_json, mimetype="application/json")
+
+
+@app.route("/webauthn/register/verify", methods=["POST"])
+def wa_register_verify():
+    data = request.get_json(silent=True) or {}
+    reg = session.get("reg")
+    if not reg:
+        return ("Session d'inscription expirée, réessaie.", 400)
+    try:
+        v = auth.verify_registration(
+            data.get("credential"), auth.b64url_to_bytes(reg["chal"]))
+    except Exception as e:
+        return (f"Passkey refusée : {e}", 400)
+    # Course anti-doublon : quelqu'un a-t-il pris l'admin entre-temps ?
+    if reg["admin"] and store.count_users() != 0:
+        session.pop("reg", None)
+        return ("Un compte admin existe déjà.", 409)
+    if not reg["admin"] and not store.invite_is_valid(reg["invite"]):
+        session.pop("reg", None)
+        return ("Invitation déjà utilisée.", 409)
+    store.create_user(reg["uid"], reg["name"], reg["admin"])
+    store.add_credential(
+        cred_id=auth.to_b64url(v.credential_id), user_id=reg["uid"],
+        public_key=v.credential_public_key, sign_count=v.sign_count or 0)
+    if reg["admin"]:
+        store.claim_legacy(reg["uid"])        # récupère les sujets d'avant-comptes
+    else:
+        store.consume_invite(reg["invite"], reg["uid"])
+    session.pop("reg", None)
+    session["uid"] = reg["uid"]
+    session.permanent = True
+    return jsonify({"ok": True})
+
+
+# --- WebAuthn : connexion (sans identifiant, passkey découvrable) ----------
+@app.route("/webauthn/authenticate/options", methods=["POST"])
+def wa_auth_options():
+    opts_json, challenge = auth.authentication_options()
+    session["auth_chal"] = auth.to_b64url(challenge)
+    return Response(opts_json, mimetype="application/json")
+
+
+@app.route("/webauthn/authenticate/verify", methods=["POST"])
+def wa_auth_verify():
+    data = request.get_json(silent=True) or {}
+    cred = data.get("credential") or {}
+    chal = session.get("auth_chal")
+    if not chal or not cred.get("id"):
+        return ("Session de connexion expirée, réessaie.", 400)
+    row = store.get_credential(cred["id"])
+    if not row:
+        return ("Passkey inconnue.", 404)
+    try:
+        v = auth.verify_authentication(
+            cred, auth.b64url_to_bytes(chal), row["public_key"], row["sign_count"])
+    except Exception as e:
+        return (f"Passkey refusée : {e}", 400)
+    store.update_sign_count(cred["id"], v.new_sign_count)
+    session.pop("auth_chal", None)
+    session["uid"] = row["user_id"]
+    session.permanent = True
+    return jsonify({"ok": True})
+
+
+# --- Administration (comptes / invitations) -------------------------------
+@app.route("/admin/invite", methods=["POST"])
+@admin_required
+def admin_invite():
+    token = secrets.token_urlsafe(24)
+    label = (request.form.get("label") or "").strip()
+    store.create_invite(token, current_uid(), label)
+    link = f"{CARDINAL_URL.rstrip('/')}/register?invite={token}"
+    return jsonify({"ok": True, "link": link})
+
+
+@app.route("/admin/users/<uid>/delete", methods=["POST"])
+@admin_required
+def admin_delete_user(uid):
+    if uid == current_uid():
+        return ("Impossible de supprimer son propre compte admin.", 400)
+    store.delete_user(uid)
+    return redirect(url_for("index"))
 
 
 @app.route("/img/<path:filename>")
@@ -562,7 +754,7 @@ def img(filename):
 @app.route("/feed/<tid>")
 def feed(tid):
     try:
-        topic = store.get_topic(tid)
+        topic = store.get_topic(tid, current_uid())   # seulement MON sujet
     except KeyError:
         abort(404)
     items = store.get_feed(tid)
@@ -578,7 +770,43 @@ def digests(filename):
     return send_from_directory(DIGESTS_DIR, filename)
 
 
-# --- Page de connexion (production) ---------------------------------------
+# --- Passkeys : helpers WebAuthn partagés (login + register) --------------
+_WA_JS = r"""
+function b64urlToBuf(s){s=s.replace(/-/g,'+').replace(/_/g,'/');const pad='='.repeat((4-s.length%4)%4);const bin=atob(s+pad);const b=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)b[i]=bin.charCodeAt(i);return b.buffer;}
+function bufToB64url(buf){const b=new Uint8Array(buf);let s='';for(let i=0;i<b.length;i++)s+=String.fromCharCode(b[i]);return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');}
+async function jpost(url,body){const r=await fetch(url,{method:'POST',headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined});if(!r.ok)throw new Error((await r.text())||('HTTP '+r.status));return r.json();}
+async function passkeyLogin(){
+  const opt=await jpost('/webauthn/authenticate/options');
+  opt.challenge=b64urlToBuf(opt.challenge);
+  if(opt.allowCredentials)opt.allowCredentials=opt.allowCredentials.map(c=>({...c,id:b64urlToBuf(c.id)}));
+  const cred=await navigator.credentials.get({publicKey:opt});
+  const body={id:cred.id,rawId:bufToB64url(cred.rawId),type:cred.type,
+    response:{clientDataJSON:bufToB64url(cred.response.clientDataJSON),
+      authenticatorData:bufToB64url(cred.response.authenticatorData),
+      signature:bufToB64url(cred.response.signature),
+      userHandle:cred.response.userHandle?bufToB64url(cred.response.userHandle):null},
+    clientExtensionResults:cred.getClientExtensionResults?cred.getClientExtensionResults():{}};
+  await jpost('/webauthn/authenticate/verify',{credential:body});
+  location.href='/';
+}
+async function passkeyRegister(name,code,invite){
+  const opt=await jpost('/webauthn/register/options',{name,code,invite});
+  opt.challenge=b64urlToBuf(opt.challenge);
+  opt.user.id=b64urlToBuf(opt.user.id);
+  if(opt.excludeCredentials)opt.excludeCredentials=opt.excludeCredentials.map(c=>({...c,id:b64urlToBuf(c.id)}));
+  const cred=await navigator.credentials.create({publicKey:opt});
+  const body={id:cred.id,rawId:bufToB64url(cred.rawId),type:cred.type,
+    response:{clientDataJSON:bufToB64url(cred.response.clientDataJSON),
+      attestationObject:bufToB64url(cred.response.attestationObject),
+      transports:cred.response.getTransports?cred.response.getTransports():[]},
+    clientExtensionResults:cred.getClientExtensionResults?cred.getClientExtensionResults():{}};
+  await jpost('/webauthn/register/verify',{name,code,invite,credential:body});
+  location.href='/';
+}
+"""
+
+
+# --- Page de connexion (passkey) ------------------------------------------
 LOGIN_PAGE = r"""<!doctype html><html lang="fr"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Cardinal — connexion</title>
@@ -600,15 +828,73 @@ LOGIN_PAGE = r"""<!doctype html><html lang="fr"><head>
  button{width:100%;margin-top:12px;padding:11px;border:0;border-radius:8px;cursor:pointer;font-weight:700;
    color:#1a1405;background:linear-gradient(180deg,#f2cf6a,#d99f2c);box-shadow:0 0 16px rgba(230,184,74,.4)}
  .err{color:#e2685f;font-size:13px;margin-top:12px;min-height:16px}
+ a{color:#e6b84a;text-decoration:none}
 </style></head><body>
- <form class="box" method="post">
+ <div class="box">
    <img src="/img/cardinal-icon.png" alt="Cardinal">
    <h1>Cardinal</h1>
-   <div class="sub">Accès protégé</div>
-   <input type="password" name="password" placeholder="Mot de passe" autofocus autocomplete="current-password">
-   <button type="submit">Entrer</button>
-   <div class="err">{{ error }}</div>
- </form>
+   <div class="sub">Connexion par passkey</div>
+   <button id="go" onclick="doLogin()">🔑 Se connecter</button>
+   <div class="err" id="err"></div>
+   <div class="sub" style="margin-top:18px;letter-spacing:normal;text-transform:none">
+     Pas encore de compte ? <a href="/register">Créer un compte</a></div>
+ </div>
+<script>""" + _WA_JS + r"""
+async function doLogin(){const b=document.getElementById('go'),e=document.getElementById('err');
+  e.textContent='';b.disabled=true;try{await passkeyLogin();}
+  catch(err){e.textContent=(''+err.message||err).slice(0,220);b.disabled=false;}}
+</script>
+</body></html>"""
+
+
+# --- Page de création de compte (passkey) ---------------------------------
+REGISTER_PAGE = r"""<!doctype html><html lang="fr"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cardinal — créer un compte</title>
+<link rel="icon" type="image/png" href="/img/favicon.png">
+<style>
+ *{box-sizing:border-box}
+ body{margin:0;min-height:100vh;display:grid;place-items:center;color:#f3e9cf;
+   font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+   background:radial-gradient(900px 480px at 50% -10%,rgba(230,184,74,.14),transparent 60%),#0a0906}
+ .box{width:min(360px,calc(100% - 32px));background:#141009;border:1px solid rgba(230,184,74,.28);
+   border-radius:14px;padding:30px 26px;box-shadow:0 0 44px rgba(230,184,74,.14);text-align:center}
+ img{width:64px;height:64px;object-fit:contain;filter:drop-shadow(0 0 14px rgba(230,184,74,.55))}
+ h1{font-size:1.3rem;letter-spacing:.12em;text-transform:uppercase;margin:12px 0 2px}
+ .sub{font-family:ui-monospace,Menlo,monospace;font-size:11px;letter-spacing:.2em;text-transform:uppercase;
+   color:#b49a63;margin-bottom:22px}
+ input{width:100%;margin-top:10px;padding:11px 13px;border:1px solid rgba(230,184,74,.28);border-radius:8px;
+   background:rgba(0,0,0,.35);color:#f3e9cf;font:inherit}
+ input:focus{outline:none;border-color:#e6b84a;box-shadow:0 0 12px rgba(230,184,74,.2)}
+ button{width:100%;margin-top:14px;padding:11px;border:0;border-radius:8px;cursor:pointer;font-weight:700;
+   color:#1a1405;background:linear-gradient(180deg,#f2cf6a,#d99f2c);box-shadow:0 0 16px rgba(230,184,74,.4)}
+ button:disabled{opacity:.6}
+ .err{color:#e2685f;font-size:13px;margin-top:12px;min-height:16px}
+ a{color:#e6b84a;text-decoration:none}
+</style></head><body>
+ <div class="box">
+   <img src="/img/cardinal-icon.png" alt="Cardinal">
+   <h1>Cardinal</h1>
+   <div class="sub">{{ 'Premier compte (admin)' if bootstrap else 'Créer un compte' }}</div>
+   {% if error %}<div class="err">{{ error }}</div>{% else %}
+   <input id="name" placeholder="Ton nom" autocomplete="name" autofocus>
+   {% if need_code %}<input id="code" type="password" placeholder="Code d'amorçage (CARDINAL_PASSWORD)" autocomplete="off">{% endif %}
+   <button id="go" onclick="doReg()">🔑 Créer ma passkey</button>
+   <div class="err" id="err"></div>
+   {% endif %}
+   <div class="sub" style="margin-top:18px;letter-spacing:normal;text-transform:none">
+     Déjà un compte ? <a href="/login">Se connecter</a></div>
+ </div>
+<script>""" + _WA_JS + r"""
+const INVITE={{ invite|tojson }};
+async function doReg(){const b=document.getElementById('go'),e=document.getElementById('err');
+  const name=(document.getElementById('name').value||'').trim();
+  const codeEl=document.getElementById('code');const code=codeEl?codeEl.value:'';
+  if(!name){e.textContent='Indique ton nom.';return;}
+  e.textContent='';b.disabled=true;
+  try{await passkeyRegister(name,code,INVITE);}
+  catch(err){e.textContent=(''+(err.message||err)).slice(0,220);b.disabled=false;}}
+</script>
 </body></html>"""
 
 
@@ -768,7 +1054,7 @@ PAGE = r"""<!doctype html><html lang="fr"><head>
  <div class="topbar">
    <button class="gear" onclick="openSettings()" title="Réglages">⚙️ Réglages
      {% if not has_key %}<span class="dot" title="Aucune clé LLM"></span>{% endif %}</button>
-   <div class="hud-srv"><span class="led {{'' if sched_on else 'off'}}"></span>srv&nbsp;007 · {{'scheduler online' if sched_on else 'scheduler standby'}}{% if auth_on %} · <a href="/logout" style="color:inherit;text-decoration:none">déconnexion</a>{% endif %}</div>
+   <div class="hud-srv"><span class="led {{'' if sched_on else 'off'}}"></span>srv&nbsp;007 · {{'scheduler online' if sched_on else 'scheduler standby'}}{% if user_name %} · {{user_name}}{% endif %} · <a href="/logout" style="color:inherit;text-decoration:none">déconnexion</a></div>
  </div>
  <header>
    <div class="mark"><img src="/img/cardinal-icon.png" alt="Cardinal"></div>
@@ -892,12 +1178,12 @@ PAGE = r"""<!doctype html><html lang="fr"><head>
    <label>Clé NVD (optionnelle — accélère les CVE produits) {% if has_nvd %}<span class="hint">(enregistrée ✓)</span>{% endif %}</label>
    <input name="nvd_key" type="password" placeholder="optionnel" autocomplete="off">
 
+   {% if is_admin %}
    <label class="check"><input type="checkbox" name="scheduler" {{'checked' if sched_on}}>
      Veille automatique : lancer chaque sujet tout seul selon sa fréquence</label>
-   <div class="hint">Interrupteur global. Chaque sujet a aussi son bouton ▶/⏸.
-     Cardinal doit rester ouvert (le terminal aussi) pour que ça tourne.</div>
+   <div class="hint">Interrupteur global (admin). Chaque sujet a aussi son bouton ▶/⏸.</div>
 
-   <label style="margin-top:14px">Notifications push (ntfy.sh)</label>
+   <label style="margin-top:14px">Notifications push (ntfy.sh) <span class="hint">— admin</span></label>
    <div class="hint">Alerte sur ton téléphone quand une <b>CVE priorité haute</b> tombe, même site fermé.
      Installe l'app <b>ntfy</b>, abonne-toi à un « topic » au nom secret, et remets ce même topic ici.</div>
    <div class="two">
@@ -910,14 +1196,35 @@ PAGE = r"""<!doctype html><html lang="fr"><head>
      <button type="button" class="btn" onclick="testNotify()">🔔 Tester la notif</button>
      <span id="notify-out" class="hint"></span>
    </div>
+   {% endif %}
 
    <div class="form-actions">
      <button class="btn-go" type="submit">Enregistrer</button>
      <button type="button" class="btn" onclick="closeSettings()">Fermer</button>
    </div>
   </form>
-  {% if auth_on %}
-  <label style="margin-top:16px">Mise à jour du serveur</label>
+  {% if is_admin %}
+  <label style="margin-top:16px">Comptes <span class="hint">— admin</span></label>
+  <div class="hint">Invite quelqu'un : partage-lui le lien généré. Il crée son compte
+    (passkey) et arrive dans SON espace (ses sujets, ses clés).</div>
+  <div class="form-actions" style="margin-top:6px">
+    <button type="button" class="btn" onclick="makeInvite()">➕ Générer un lien d'invitation</button>
+  </div>
+  <input id="invite-link" readonly onclick="this.select()" placeholder="le lien apparaîtra ici"
+     style="width:100%;margin-top:8px;display:none">
+  <div style="margin-top:12px">
+   {% for u in users %}
+    <div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-top:1px solid var(--line)">
+     <span style="flex:1">{{u.name}} {% if u.is_admin %}<span class="hint">(admin)</span>{% endif %}</span>
+     {% if not u.is_admin %}
+     <form method="post" action="/admin/users/{{u.id}}/delete" onsubmit="return confirm('Supprimer {{u.name}} et tout son espace ?')">
+       <button type="submit" class="btn" style="padding:4px 10px">Supprimer</button></form>
+     {% endif %}
+    </div>
+   {% endfor %}
+  </div>
+
+  <label style="margin-top:16px">Mise à jour du serveur <span class="hint">— admin</span></label>
   <div class="hint">Récupère la dernière version (<code>git pull</code>) puis redémarre Cardinal —
     redémarrage seulement s'il y a du nouveau.</div>
   <div class="form-actions">
@@ -1003,6 +1310,13 @@ document.getElementById('edit').addEventListener('click',e=>{if(e.target.id==='e
 // Réglages (modale)
 function openSettings(){document.getElementById('settings').classList.add('on');return false;}
 function closeSettings(){document.getElementById('settings').classList.remove('on');}
+async function makeInvite(){
+ const el=document.getElementById('invite-link');
+ try{
+  const d=await (await fetch('/admin/invite',{method:'POST'})).json();
+  el.style.display='block'; el.value=d.link; el.focus(); el.select();
+ }catch(e){ el.style.display='block'; el.value='Erreur : '+e; }
+}
 async function updateApp(){
  const btn=document.getElementById('update-btn'), out=document.getElementById('update-out');
  btn.disabled=true; out.style.display='block'; out.textContent='Mise à jour…';

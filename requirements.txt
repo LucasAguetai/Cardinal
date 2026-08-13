@@ -3,4 +3,5 @@ openai>=1.40
 feedparser>=6.0
 requests>=2.31
 python-dotenv>=1.0
+webauthn>=2.0    # passkeys (connexion WebAuthn multi-comptes)
 gunicorn>=21.2   # serveur de production (déploiement)

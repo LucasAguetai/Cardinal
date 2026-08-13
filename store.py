@@ -67,6 +67,32 @@ def init_db():
                 key   TEXT PRIMARY KEY,
                 value TEXT
             );
+            -- Comptes (multi-utilisateurs). Le premier créé est admin.
+            CREATE TABLE IF NOT EXISTS users (
+                id         TEXT PRIMARY KEY,
+                name       TEXT NOT NULL,
+                is_admin   INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+            -- Passkeys WebAuthn : 1 credential = 1 ligne (un user peut en avoir plusieurs).
+            CREATE TABLE IF NOT EXISTS credentials (
+                cred_id    TEXT PRIMARY KEY,        -- base64url de l'ID de credential
+                user_id    TEXT NOT NULL,
+                public_key BLOB NOT NULL,
+                sign_count INTEGER NOT NULL DEFAULT 0,
+                transports TEXT,
+                created_at TEXT NOT NULL
+            );
+            -- Invitations : jeton à usage unique pour créer un compte non-admin.
+            CREATE TABLE IF NOT EXISTS invites (
+                token      TEXT PRIMARY KEY,
+                created_by TEXT NOT NULL,
+                label      TEXT,
+                created_at TEXT NOT NULL,
+                used_by    TEXT,
+                used_at    TEXT,
+                expires_at TEXT
+            );
             """
         )
         # Migrations douces des bases déjà créées.
@@ -76,6 +102,10 @@ def init_db():
         tcols = [r["name"] for r in c.execute("PRAGMA table_info(topics)")]
         if "enabled" not in tcols:
             c.execute("ALTER TABLE topics ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
+        # Multi-utilisateurs : propriétaire du sujet. NULL = données « legacy »
+        # (créées avant l'introduction des comptes) — réattribuées au 1er admin.
+        if "owner_id" not in tcols:
+            c.execute("ALTER TABLE topics ADD COLUMN owner_id TEXT")
     seed_topics()
 
 
@@ -94,6 +124,7 @@ def _config_of(t: Topic) -> str:
 
 def _row_to_topic(row) -> Topic:
     cfg = json.loads(row["config"])
+    keys = row.keys()
     return Topic(
         id=row["id"],
         name=row["name"],
@@ -103,6 +134,7 @@ def _row_to_topic(row) -> Topic:
         packages=cfg.get("packages", []),
         keywords=cfg.get("keywords", []),
         min_severity=cfg.get("min_severity", ""),
+        owner_id=(row["owner_id"] if "owner_id" in keys else None),
     )
 
 
@@ -119,27 +151,45 @@ def seed_topics():
             )
 
 
-def list_topics() -> list:
+def list_topics(owner_id: str = None) -> list:
+    """Tous les sujets, ou seulement ceux d'un propriétaire si `owner_id` est fourni.
+    Le scheduler appelle sans argument (il itère tous les espaces)."""
     with _conn() as c:
-        rows = c.execute("SELECT * FROM topics ORDER BY name").fetchall()
+        if owner_id is None:
+            rows = c.execute("SELECT * FROM topics ORDER BY name").fetchall()
+        else:
+            rows = c.execute("SELECT * FROM topics WHERE owner_id=? ORDER BY name",
+                             (owner_id,)).fetchall()
     return [_row_to_topic(r) for r in rows]
 
 
-def get_topic(topic_id: str) -> Topic:
+def get_topic(topic_id: str, owner_id: str = None) -> Topic:
+    """Sujet par id. Si `owner_id` est fourni, refuse (KeyError) un sujet qui ne lui
+    appartient pas → isolation appliquée côté base."""
     with _conn() as c:
         row = c.execute("SELECT * FROM topics WHERE id=?", (topic_id,)).fetchone()
     if not row:
         raise KeyError(f"Sujet inconnu : {topic_id}")
-    return _row_to_topic(row)
+    t = _row_to_topic(row)
+    if owner_id is not None and t.owner_id != owner_id:
+        raise KeyError(f"Sujet inconnu : {topic_id}")
+    return t
+
+
+def topic_id_available(topic_id: str) -> bool:
+    """L'id de sujet est un PK global (unique dans toute l'instance)."""
+    with _conn() as c:
+        return c.execute("SELECT 1 FROM topics WHERE id=?", (topic_id,)).fetchone() is None
 
 
 def upsert_topic(t: Topic):
     with _conn() as c:
         c.execute(
-            "INSERT INTO topics (id, name, source, frequency_hours, config) VALUES (?,?,?,?,?) "
+            "INSERT INTO topics (id, name, source, frequency_hours, config, owner_id) "
+            "VALUES (?,?,?,?,?,?) "
             "ON CONFLICT(id) DO UPDATE SET name=excluded.name, source=excluded.source, "
             "frequency_hours=excluded.frequency_hours, config=excluded.config",
-            (t.id, t.name, t.source, t.frequency_hours, _config_of(t)),
+            (t.id, t.name, t.source, t.frequency_hours, _config_of(t), t.owner_id),
         )
 
 
@@ -147,6 +197,8 @@ def delete_topic(topic_id: str):
     with _conn() as c:
         c.execute("DELETE FROM topics WHERE id=?", (topic_id,))
         c.execute("DELETE FROM runs WHERE topic_id=?", (topic_id,))
+        c.execute("DELETE FROM feed_items WHERE topic_id=?", (topic_id,))
+        c.execute("DELETE FROM seen WHERE topic_id=?", (topic_id,))
 
 
 def is_enabled(topic_id: str) -> bool:
@@ -229,14 +281,22 @@ def get_feed(topic_id: str, days: int = FEED_DAYS) -> list:
     return out
 
 
-def feed_items_between(start_iso: str, end_iso: str) -> list:
-    """Tous les items du feed (tous sujets) créés dans [start, end[, récents d'abord.
-    Sert au récap du jour."""
+def feed_items_between(start_iso: str, end_iso: str, owner_id: str = None) -> list:
+    """Items du feed créés dans [start, end[, récents d'abord. Sert au récap du jour.
+    Si `owner_id` est fourni, ne renvoie que les items des sujets de ce propriétaire
+    (jointure sur topics) → chaque user ne voit que son récap."""
     with _conn() as c:
-        rows = c.execute(
-            "SELECT * FROM feed_items WHERE created_at>=? AND created_at<? ORDER BY id DESC",
-            (start_iso, end_iso),
-        ).fetchall()
+        if owner_id is None:
+            rows = c.execute(
+                "SELECT * FROM feed_items WHERE created_at>=? AND created_at<? ORDER BY id DESC",
+                (start_iso, end_iso),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT f.* FROM feed_items f JOIN topics t ON t.id=f.topic_id "
+                "WHERE t.owner_id=? AND f.created_at>=? AND f.created_at<? ORDER BY f.id DESC",
+                (owner_id, start_iso, end_iso),
+            ).fetchall()
     out = []
     for r in rows:
         d = dict(r)
@@ -316,3 +376,137 @@ def get_setting(key: str, default=None):
     with _conn() as c:
         row = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     return row["value"] if row and row["value"] else default
+
+
+# --- Réglages PAR UTILISATEUR (clés API perso) ----------------------------
+# On réutilise la table `settings` en namespaçant la clé : « u:{uid}:{KEY} ».
+# Les réglages d'instance (NTFY_*, SCHEDULER_ENABLED, SECRET_KEY) restent en clé nue.
+def _ukey(uid: str, key: str) -> str:
+    return f"u:{uid}:{key}"
+
+
+def set_user_setting(uid: str, key: str, value: str):
+    set_setting(_ukey(uid, key), value)
+
+
+def get_user_setting(uid: str, key: str, default=None):
+    return get_setting(_ukey(uid, key), default)
+
+
+def delete_user_settings(uid: str):
+    with _conn() as c:
+        c.execute("DELETE FROM settings WHERE key LIKE ?", (f"u:{uid}:%",))
+
+
+# --- Comptes / passkeys / invitations -------------------------------------
+def count_users() -> int:
+    with _conn() as c:
+        return c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+
+def create_user(uid: str, name: str, is_admin: bool) -> dict:
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO users (id, name, is_admin, created_at) VALUES (?,?,?,?)",
+            (uid, name, 1 if is_admin else 0,
+             dt.datetime.now(dt.timezone.utc).isoformat()),
+        )
+    return get_user(uid)
+
+
+def get_user(uid: str):
+    with _conn() as c:
+        row = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_users() -> list:
+    with _conn() as c:
+        rows = c.execute("SELECT * FROM users ORDER BY created_at").fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_user(uid: str):
+    """Supprime un compte et TOUT son espace (sujets, feed, runs, clés, passkeys)."""
+    with _conn() as c:
+        tids = [r["id"] for r in c.execute("SELECT id FROM topics WHERE owner_id=?", (uid,))]
+        for tid in tids:
+            c.execute("DELETE FROM runs WHERE topic_id=?", (tid,))
+            c.execute("DELETE FROM feed_items WHERE topic_id=?", (tid,))
+            c.execute("DELETE FROM seen WHERE topic_id=?", (tid,))
+        c.execute("DELETE FROM topics WHERE owner_id=?", (uid,))
+        c.execute("DELETE FROM credentials WHERE user_id=?", (uid,))
+        c.execute("DELETE FROM settings WHERE key LIKE ?", (f"u:{uid}:%",))
+        c.execute("DELETE FROM users WHERE id=?", (uid,))
+
+
+def add_credential(cred_id: str, user_id: str, public_key: bytes,
+                   sign_count: int, transports: str = ""):
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO credentials (cred_id, user_id, public_key, sign_count, "
+            "transports, created_at) VALUES (?,?,?,?,?,?)",
+            (cred_id, user_id, public_key, sign_count, transports,
+             dt.datetime.now(dt.timezone.utc).isoformat()),
+        )
+
+
+def get_credential(cred_id: str):
+    with _conn() as c:
+        row = c.execute("SELECT * FROM credentials WHERE cred_id=?", (cred_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def update_sign_count(cred_id: str, sign_count: int):
+    with _conn() as c:
+        c.execute("UPDATE credentials SET sign_count=? WHERE cred_id=?",
+                  (sign_count, cred_id))
+
+
+def create_invite(token: str, created_by: str, label: str = "", expires_at: str = None):
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO invites (token, created_by, label, created_at, expires_at) "
+            "VALUES (?,?,?,?,?)",
+            (token, created_by, label,
+             dt.datetime.now(dt.timezone.utc).isoformat(), expires_at),
+        )
+
+
+def get_invite(token: str):
+    with _conn() as c:
+        row = c.execute("SELECT * FROM invites WHERE token=?", (token,)).fetchone()
+    return dict(row) if row else None
+
+
+def invite_is_valid(token: str) -> bool:
+    inv = get_invite(token)
+    if not inv or inv["used_by"]:
+        return False
+    if inv["expires_at"] and inv["expires_at"] < dt.datetime.now(dt.timezone.utc).isoformat():
+        return False
+    return True
+
+
+def consume_invite(token: str, used_by: str):
+    with _conn() as c:
+        c.execute("UPDATE invites SET used_by=?, used_at=? WHERE token=?",
+                  (used_by, dt.datetime.now(dt.timezone.utc).isoformat(), token))
+
+
+def list_invites(created_by: str = None) -> list:
+    with _conn() as c:
+        if created_by is None:
+            rows = c.execute("SELECT * FROM invites ORDER BY created_at DESC").fetchall()
+        else:
+            rows = c.execute("SELECT * FROM invites WHERE created_by=? ORDER BY created_at DESC",
+                             (created_by,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def claim_legacy(uid: str) -> int:
+    """Réattribue au 1er admin toutes les données « legacy » (owner_id NULL) créées
+    avant l'introduction des comptes. Renvoie le nombre de sujets réattribués."""
+    with _conn() as c:
+        cur = c.execute("UPDATE topics SET owner_id=? WHERE owner_id IS NULL", (uid,))
+        return cur.rowcount
