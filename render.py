@@ -233,10 +233,12 @@ def render_feed(topic, items: list, days: int = 30, has_run: bool = True) -> str
   .meta {{ font-family: ui-sans-serif, system-ui, sans-serif; font-size:13px;
           color:var(--muted); border-bottom:1px solid var(--line);
           padding-bottom:20px; margin-bottom:12px; }}
-  .day {{ position:sticky; top:0; background:#f5f5f4;
-         font-family: ui-sans-serif, system-ui, sans-serif; font-weight:700;
-         font-size:13px; letter-spacing:.03em; text-transform:uppercase;
-         color:var(--muted); padding:18px 0 8px; }}
+  .day {{ position:sticky; top:0; z-index:2; background:#f5f5f4;
+         font-family: ui-sans-serif, system-ui, sans-serif; font-weight:800;
+         font-size:13px; letter-spacing:.06em; text-transform:uppercase;
+         color:var(--accent); margin-top:40px;
+         padding:12px 0 9px; border-top:2px solid var(--accent); }}
+  .day:first-of-type {{ margin-top:6px; border-top:none; }}
   .item {{ border-top:1px solid var(--line); padding:22px 0; }}
   .itemhead {{ display:flex; align-items:center; gap:10px; }}
   .when {{ font-family: ui-sans-serif, system-ui, sans-serif; font-size:12px;
