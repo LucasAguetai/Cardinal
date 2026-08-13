@@ -134,6 +134,22 @@ def _ntfy_target():
     return server, topic
 
 
+def _ntfy_target_for(uid):
+    """Cible ntfy (server, topic) POUR un utilisateur donné.
+    - Serveur : réglage d'instance NTFY_SERVER (le même serveur partagé pour tous).
+    - Topic   : l'admin garde son topic global (NTFY_TOPIC) ; chaque invité a un
+      topic auto « Cardinal-{uid} » sur ce même serveur.
+    Les invités ne reçoivent des push que si l'admin a configuré un serveur partagé
+    (sinon (server, '') → pas d'envoi)."""
+    server = (store.get_setting("NTFY_SERVER", "") or "").strip().rstrip("/")
+    user = store.get_user(uid) if uid else None
+    if user and user["is_admin"]:
+        return (server or "https://ntfy.sh"), (store.get_setting("NTFY_TOPIC", "") or "").strip()
+    if not server:
+        return "", ""                     # pas de serveur partagé → pas de push invité
+    return server, (f"Cardinal-{uid}" if uid else "")
+
+
 _NTFY_PRIO = {"min": 1, "low": 2, "default": 3, "high": 4, "max": 5, "urgent": 5}
 
 
@@ -162,10 +178,10 @@ def _send_ntfy(title, body, click=None, priority="default", tags=None, server=No
         return False, str(e)
 
 
-def _notify_new_high(topic, high_items):
-    """Push résumant les nouveautés de priorité HAUTE ajoutées lors d'un run.
-    Le libellé s'adapte à la source : « CVE » pour les sujets vulnérabilités
-    (OSV/NVD/KEV), « nouveauté » pour les sujets d'actu/RSS (ex. Sword Art Online)."""
+def _notify_new_high(topic, high_items, server=None, ntfy_topic=None):
+    """Push résumant les nouveautés de priorité HAUTE ajoutées lors d'un run, vers le
+    topic ntfy du propriétaire du sujet. Le libellé s'adapte à la source : « CVE » pour
+    les vulnérabilités (OSV/NVD/KEV), « nouveauté » pour l'actu/RSS."""
     n = len(high_items)
     suf = "s" if n > 1 else ""
     noun = f"{n} CVE prioritaire{suf}" if topic.source in ("osv", "nvd", "kev") \
@@ -174,7 +190,8 @@ def _notify_new_high(topic, high_items):
     if n > 5:
         lines.append(f"… +{n - 5} autre(s)")
     _send_ntfy(f"Cardinal · {topic.name} : {noun}", "\n".join(lines),
-               click=f"{CARDINAL_URL}/feed/{topic.id}", priority="high", tags="rotating_light")
+               click=f"{CARDINAL_URL}/feed/{topic.id}", priority="high",
+               tags="rotating_light", server=server, topic=ntfy_topic)
 
 
 def _core_run(topic) -> int:
@@ -197,15 +214,16 @@ def _core_run(topic) -> int:
         store.mark_seen(topic.id, keys)
     store.save_run(topic.id, "", digest)   # garde l'horodatage du dernier run
     store.purge_feed()                     # fenêtre glissante : retire ce qui a > 1 mois
-    # Push ntfy : réservé à l'admin (ntfy est admin-only) → pas de fuite des titres
-    # d'autres utilisateurs vers son téléphone.
+    # Push ntfy vers le topic DU PROPRIÉTAIRE : admin → son topic global ;
+    # invité → « Cardinal-{uid} » sur le serveur partagé (si l'admin en a configuré un).
     highs = [it for it in new_items if it.get("importance") == "high"]
-    owner = store.get_user(topic.owner_id) if topic.owner_id else None
-    if highs and owner and owner["is_admin"]:
-        try:
-            _notify_new_high(topic, highs)     # push : seulement les nouveautés prioritaires
-        except Exception as e:
-            print(f"[notify] échec : {e}")
+    if highs:
+        server, ntopic = _ntfy_target_for(topic.owner_id)
+        if ntopic:
+            try:
+                _notify_new_high(topic, highs, server=server, ntfy_topic=ntopic)
+            except Exception as e:
+                print(f"[notify] échec : {e}")
     return len(new_items)
 
 
@@ -365,6 +383,9 @@ def index():
         has_nvd=bool(store.get_user_setting(uid, "NVD_API_KEY")),
         ntfy_topic=(store.get_setting("NTFY_TOPIC", "") or "") if admin else "",
         ntfy_server=(store.get_setting("NTFY_SERVER", "") or "") if admin else "",
+        # Pour les invités : serveur partagé (lecture seule) + leur topic auto.
+        ntfy_pub_server=(store.get_setting("NTFY_SERVER", "") or "").strip(),
+        ntfy_user_topic=f"Cardinal-{uid}",
         users=(store.list_users() if admin else []),
     )
 
@@ -459,13 +480,21 @@ def save_settings():
 
 
 @app.route("/api/notify-test", methods=["POST"])
-@admin_required
 def api_notify_test():
     data = request.get_json(silent=True) or {}
+    if _is_admin():
+        server = data.get("server") or None
+        topic = data.get("topic") or None
+    else:
+        # Invité : on force SON topic (Cardinal-{uid}) sur le serveur partagé.
+        server, topic = _ntfy_target_for(current_uid())
+        if not topic:
+            return jsonify({"ok": False,
+                            "msg": "Notifications non configurées par l'admin."})
     ok, msg = _send_ntfy(
         "Cardinal: test", "Notification de test — si tu reçois ceci, c'est bon !",
         click=CARDINAL_URL, priority="default", tags="white_check_mark",
-        topic=(data.get("topic") or None), server=(data.get("server") or None))
+        topic=topic, server=server)
     return jsonify({"ok": ok, "msg": msg})
 
 
@@ -1198,6 +1227,22 @@ PAGE = r"""<!doctype html><html lang="fr"><head>
    </div>
    {% endif %}
 
+   {% if not is_admin and ntfy_pub_server %}
+   <label style="margin-top:14px">Notifications push (ntfy)</label>
+   <div class="hint">Reçois une alerte quand une <b>CVE priorité haute</b> tombe sur TES sujets,
+     même site fermé. Installe l'app <b>ntfy</b>, ajoute ce serveur, et abonne-toi à ton topic :</div>
+   <div class="two">
+    <div><label>Serveur</label>
+     <input value="{{ntfy_pub_server}}" readonly onclick="this.select()"></div>
+    <div><label>Ton topic</label>
+     <input value="{{ntfy_user_topic}}" readonly onclick="this.select()"></div>
+   </div>
+   <div class="form-actions" style="margin-top:8px">
+     <button type="button" class="btn" onclick="testNotify()">🔔 Tester la notif</button>
+     <span id="notify-out" class="hint"></span>
+   </div>
+   {% endif %}
+
    <div class="form-actions">
      <button class="btn-go" type="submit">Enregistrer</button>
      <button type="button" class="btn" onclick="closeSettings()">Fermer</button>
@@ -1334,9 +1379,12 @@ async function updateApp(){
 }
 async function testNotify(){
  const out=document.getElementById('notify-out');
- const topic=document.querySelector('#settings [name=ntfy_topic]').value.trim();
- const server=document.querySelector('#settings [name=ntfy_server]').value.trim();
- if(!topic){ out.textContent='Renseigne un topic d\'abord.'; return; }
+ // Admin : champs éditables. Invité : pas de champs → le serveur vise son propre topic.
+ const tEl=document.querySelector('#settings [name=ntfy_topic]');
+ const sEl=document.querySelector('#settings [name=ntfy_server]');
+ const topic=tEl?tEl.value.trim():'';
+ const server=sEl?sEl.value.trim():'';
+ if(tEl && !topic){ out.textContent='Renseigne un topic d\'abord.'; return; }
  out.textContent='Envoi…';
  try{
   const d=await (await fetch('/api/notify-test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({topic,server})})).json();

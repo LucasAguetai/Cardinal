@@ -395,6 +395,25 @@ def t_admin_required():
         assert _protected() == "ok", "l'admin devrait passer"
 
 
+# 17) Cibles ntfy par-utilisateur : admin = topic global ; invité = Cardinal-{uid}
+#     sur le serveur partagé ; pas de serveur partagé = pas de push invité.
+def t_ntfy_targets():
+    import app
+    store.init_db()
+    with store._conn() as c:
+        c.execute("DELETE FROM users")
+    store.create_user("ADM", "Admin", True)
+    store.create_user("G", "Guest", False)
+    store.set_setting("NTFY_SERVER", "https://ntfy.aguetai.fr")
+    store.set_setting("NTFY_TOPIC", "Cardinal-adminsecret")
+    s, t = app._ntfy_target_for("ADM")
+    assert (s, t) == ("https://ntfy.aguetai.fr", "Cardinal-adminsecret"), (s, t)
+    s, t = app._ntfy_target_for("G")
+    assert (s, t) == ("https://ntfy.aguetai.fr", "Cardinal-G"), (s, t)
+    store.set_setting("NTFY_SERVER", "")          # plus de serveur partagé
+    assert app._ntfy_target_for("G") == ("", ""), "invité ne doit pas être notifié sans serveur"
+
+
 print("Cardinal — self-test (hors-ligne)\n")
 check("Chargement des sujets", t_topics)
 check("Parsing RSS + fenêtre + nettoyage HTML", t_rss)
@@ -413,6 +432,7 @@ check("Comptes : isolation + réglages perso + invitations", t_accounts)
 check("Reprise du legacy (sujets → 1er admin)", t_claim_legacy)
 check("Clés par-utilisateur (contexte de run)", t_user_keys_context)
 check("Rôle admin (@admin_required → 403)", t_admin_required)
+check("Cibles ntfy par-utilisateur (admin vs invité)", t_ntfy_targets)
 
 # nettoyage
 for f in (store.DB_PATH,):
