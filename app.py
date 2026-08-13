@@ -75,7 +75,19 @@ if not app.secret_key:
 app.permanent_session_lifetime = dt.timedelta(days=30)
 
 # Chemins publics (pas de session requise).
-_PUBLIC_EXACT = {"/login", "/register", "/healthz"}
+_PUBLIC_EXACT = {"/login", "/register", "/healthz", "/manifest.webmanifest"}
+
+# Métadonnées « web app ». Safari n'autorise aucun site à masquer le domaine dans
+# sa barre d'adresse (anti-usurpation). En revanche, ajouté à l'écran d'accueil,
+# Cardinal s'ouvre en mode autonome — sans barre d'URL — sous le nom « Cardinal ».
+_HEAD_APP = r"""<link rel="manifest" href="/manifest.webmanifest">
+<meta name="application-name" content="Cardinal">
+<meta name="apple-mobile-web-app-title" content="Cardinal">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="theme-color" content="#0a0906">
+<link rel="apple-touch-icon" href="/img/cardinal-icon.png">"""
 
 
 @app.before_request
@@ -780,6 +792,27 @@ def img(filename):
     return send_from_directory(os.path.join(BASE_DIR, "img"), filename)
 
 
+@app.route("/manifest.webmanifest")
+def manifest():
+    """Permet « Ajouter à l'écran d'accueil » : l'app s'ouvre alors en plein
+    écran (sans barre d'adresse) et s'appelle « Cardinal »."""
+    return jsonify({
+        "name": "Cardinal",
+        "short_name": "Cardinal",
+        "description": "Veille autonome : CVE et actualités.",
+        "start_url": "/",
+        "scope": "/",
+        "display": "standalone",
+        "orientation": "portrait",
+        "background_color": "#0a0906",
+        "theme_color": "#0a0906",
+        "icons": [
+            {"src": "/img/cardinal-icon.png", "sizes": "512x512", "type": "image/png"},
+            {"src": "/img/favicon.png", "sizes": "64x64", "type": "image/png"},
+        ],
+    })
+
+
 @app.route("/feed/<tid>")
 def feed(tid):
     try:
@@ -840,6 +873,7 @@ LOGIN_PAGE = r"""<!doctype html><html lang="fr"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Cardinal — connexion</title>
 <link rel="icon" type="image/png" href="/img/favicon.png">
+""" + _HEAD_APP + r"""
 <style>
  *{box-sizing:border-box}
  body{margin:0;min-height:100vh;display:grid;place-items:center;color:#f3e9cf;
@@ -885,6 +919,7 @@ REGISTER_PAGE = r"""<!doctype html><html lang="fr"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Cardinal — créer un compte</title>
 <link rel="icon" type="image/png" href="/img/favicon.png">
+""" + _HEAD_APP + r"""
 <style>
  *{box-sizing:border-box}
  body{margin:0;min-height:100vh;display:grid;place-items:center;color:#f3e9cf;
@@ -939,7 +974,7 @@ PAGE = r"""<!doctype html><html lang="fr"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Cardinal — veille</title>
 <link rel="icon" type="image/png" href="/img/favicon.png">
-<link rel="apple-touch-icon" href="/img/cardinal-icon.png">
+""" + _HEAD_APP + r"""
 <style>
  /* DA façon HUD "Cardinal / ARGUS" (Sword Art Online) : or sur noir, lignes fines, lueurs. */
  :root{
