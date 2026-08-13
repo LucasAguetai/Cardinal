@@ -847,7 +847,11 @@ LOGIN_PAGE = r"""<!doctype html><html lang="fr"><head>
    background:radial-gradient(900px 480px at 50% -10%,rgba(230,184,74,.14),transparent 60%),#0a0906}
  .box{width:min(360px,calc(100% - 32px));background:#141009;border:1px solid rgba(230,184,74,.28);
    border-radius:14px;padding:30px 26px;box-shadow:0 0 44px rgba(230,184,74,.14);text-align:center}
- img{width:64px;height:64px;object-fit:contain;filter:drop-shadow(0 0 14px rgba(230,184,74,.55))}
+ /* Halo en dégradé DERRIÈRE le logo : un filter:drop-shadow sur l'<img> est
+    rastérisé par Safari avant le décodage de l'image → carré doré visible. */
+ .logo{width:92px;height:92px;margin:0 auto;padding:14px;display:grid;place-items:center;
+   background:radial-gradient(circle,rgba(230,184,74,.40),rgba(230,184,74,.11) 42%,transparent 68%)}
+ .logo img{width:100%;height:100%;object-fit:contain;display:block}
  h1{font-size:1.3rem;letter-spacing:.12em;text-transform:uppercase;margin:12px 0 2px}
  .sub{font-family:ui-monospace,Menlo,monospace;font-size:11px;letter-spacing:.2em;text-transform:uppercase;
    color:#b49a63;margin-bottom:22px}
@@ -860,7 +864,7 @@ LOGIN_PAGE = r"""<!doctype html><html lang="fr"><head>
  a{color:#e6b84a;text-decoration:none}
 </style></head><body>
  <div class="box">
-   <img src="/img/cardinal-icon.png" alt="Cardinal">
+   <div class="logo"><img src="/img/cardinal-icon.png" alt="Cardinal"></div>
    <h1>Cardinal</h1>
    <div class="sub">Connexion par passkey</div>
    <button id="go" onclick="doLogin()">🔑 Se connecter</button>
@@ -888,7 +892,10 @@ REGISTER_PAGE = r"""<!doctype html><html lang="fr"><head>
    background:radial-gradient(900px 480px at 50% -10%,rgba(230,184,74,.14),transparent 60%),#0a0906}
  .box{width:min(360px,calc(100% - 32px));background:#141009;border:1px solid rgba(230,184,74,.28);
    border-radius:14px;padding:30px 26px;box-shadow:0 0 44px rgba(230,184,74,.14);text-align:center}
- img{width:64px;height:64px;object-fit:contain;filter:drop-shadow(0 0 14px rgba(230,184,74,.55))}
+ /* cf. LOGIN_PAGE : halo en dégradé plutôt qu'un drop-shadow (bug de rendu Safari) */
+ .logo{width:92px;height:92px;margin:0 auto;padding:14px;display:grid;place-items:center;
+   background:radial-gradient(circle,rgba(230,184,74,.40),rgba(230,184,74,.11) 42%,transparent 68%)}
+ .logo img{width:100%;height:100%;object-fit:contain;display:block}
  h1{font-size:1.3rem;letter-spacing:.12em;text-transform:uppercase;margin:12px 0 2px}
  .sub{font-family:ui-monospace,Menlo,monospace;font-size:11px;letter-spacing:.2em;text-transform:uppercase;
    color:#b49a63;margin-bottom:22px}
@@ -902,7 +909,7 @@ REGISTER_PAGE = r"""<!doctype html><html lang="fr"><head>
  a{color:#e6b84a;text-decoration:none}
 </style></head><body>
  <div class="box">
-   <img src="/img/cardinal-icon.png" alt="Cardinal">
+   <div class="logo"><img src="/img/cardinal-icon.png" alt="Cardinal"></div>
    <h1>Cardinal</h1>
    <div class="sub">{{ 'Premier compte (admin)' if bootstrap else 'Créer un compte' }}</div>
    {% if error %}<div class="err">{{ error }}</div>{% else %}
@@ -953,8 +960,10 @@ PAGE = r"""<!doctype html><html lang="fr"><head>
      #0a0906;}
  .wrap{max-width:980px;margin:0 auto;padding:34px 20px 96px}
  header{display:flex;align-items:center;gap:16px;margin-bottom:4px}
- .mark{width:58px;height:58px;flex:none;display:grid;place-items:center}
- .mark img{width:100%;height:100%;object-fit:contain;filter:drop-shadow(0 0 14px rgba(230,184,74,.55))}
+ /* cf. LOGIN_PAGE : halo en dégradé plutôt qu'un drop-shadow (bug de rendu Safari) */
+ .mark{width:74px;height:74px;flex:none;margin:-8px;padding:8px;display:grid;place-items:center;
+   background:radial-gradient(circle,rgba(230,184,74,.36),rgba(230,184,74,.10) 44%,transparent 68%)}
+ .mark img{width:100%;height:100%;object-fit:contain;display:block}
  h1{font-size:1.7rem;margin:0;letter-spacing:.09em;line-height:1.05;text-transform:uppercase;font-weight:800;
    text-shadow:0 0 20px rgba(230,184,74,.4)}
  .sub{color:var(--muted);font-size:11.5px;margin-top:4px;letter-spacing:.24em;text-transform:uppercase;
