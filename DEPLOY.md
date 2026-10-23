@@ -63,12 +63,20 @@ GROQ_API_KEY=...
 OPENROUTER_API_KEY=...
 NVD_API_KEY=            # optionnel
 
-# Production
-CARDINAL_PASSWORD=choisis-un-mot-de-passe-solide   # active le login
-CARDINAL_SECRET_KEY=colle-ici-une-longue-chaine-aleatoire
-CARDINAL_SCHEDULER=1                               # démarre la veille auto sous gunicorn
+# Production — NE COPIE PAS CES VALEURS : génère-les (commandes ci-dessous).
+CARDINAL_PASSWORD=<GENERE-MOI>     # code d'amorçage du 1er compte admin
+CARDINAL_SECRET_KEY=<GENERE-MOI>   # clé de signature des sessions
+CARDINAL_SCHEDULER=1               # démarre la veille auto sous gunicorn
 ```
-Génère une clé secrète : `python3 -c "import secrets; print(secrets.token_hex(32))"`.
+
+Génère les deux secrets (une commande, deux valeurs distinctes à coller) :
+```bash
+python3 -c "import secrets; print('CARDINAL_PASSWORD=' + secrets.token_urlsafe(24)); print('CARDINAL_SECRET_KEY=' + secrets.token_hex(32))"
+```
+
+> ⚠️ **`CARDINAL_PASSWORD` est obligatoire en production.** Sans lui, Cardinal
+> refuse désormais la création du premier compte depuis l'extérieur (403) : c'est
+> ce qui empêche un inconnu de rafler le compte admin sur une instance fraîche.
 
 ---
 
@@ -128,7 +136,7 @@ Caddy obtient tout seul le certificat Let's Encrypt (le DNS doit déjà pointer 
 ## 6. Vérifier
 
 - Ouvre **https://cardinal.aguetai.fr** → page de connexion Cardinal.
-- Entre `CARDINAL_PASSWORD` → dashboard.
+- « Créer un compte » → ton nom + `CARDINAL_PASSWORD` comme code d'amorçage → passkey → dashboard admin.
 - `curl https://cardinal.aguetai.fr/healthz` → `ok`.
 
 ## Mettre à jour plus tard
@@ -143,6 +151,7 @@ Toute la donnée est dans **`/opt/cardinal/cardinal.db`** — copie ce fichier p
 ---
 
 ### Notes
-- **Sans** `CARDINAL_PASSWORD`, l'app n'a pas de login (mode local `python app.py`). En prod, définis-le **toujours** : sinon n'importe qui consommerait tes quotas.
+- **Sans** `CARDINAL_PASSWORD`, la création du premier compte n'est possible **qu'en local** (`python app.py`) ; depuis l'extérieur elle est refusée (403). En prod, définis-le **toujours**, sinon tu ne pourras pas créer ton compte admin.
+- Les comptes suivants ne passent pas par ce code : l'admin génère un **lien d'invitation** depuis Réglages → Administration.
 - Le scheduler ne tourne que si `CARDINAL_SCHEDULER=1` (gunicorn). En local, `python app.py` le démarre tout seul.
 - Quotas gratuits : un seul utilisateur (toi) reste dans les limites Gemini/Groq. Ne partage pas le mot de passe largement.

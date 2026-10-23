@@ -57,7 +57,10 @@ def registration_options(user_id: bytes, user_name: str, exclude_ids=None) -> st
         user_id=user_id, user_name=user_name, user_display_name=user_name,
         authenticator_selection=AuthenticatorSelectionCriteria(
             resident_key=ResidentKeyRequirement.PREFERRED,
-            user_verification=UserVerificationRequirement.PREFERRED,
+            # REQUIRED : l'authentificateur doit vérifier la personne (Face ID,
+            # Touch ID, PIN). Sur téléphone c'est déjà le cas en pratique ; ça
+            # ferme le scénario « appareil déverrouillé perdu ou volé ».
+            user_verification=UserVerificationRequirement.REQUIRED,
         ),
         exclude_credentials=exclude,
     )
@@ -72,7 +75,7 @@ def verify_registration(credential, expected_challenge: bytes):
         expected_challenge=expected_challenge,
         expected_rp_id=rp_id(),
         expected_origin=origin(),
-        require_user_verification=False,
+        require_user_verification=True,
     )
 
 
@@ -82,7 +85,7 @@ def authentication_options() -> str:
     (allowCredentials vide → passkeys découvrables). Renvoie (json_str, challenge_bytes)."""
     opts = webauthn.generate_authentication_options(
         rp_id=rp_id(),
-        user_verification=UserVerificationRequirement.PREFERRED,
+        user_verification=UserVerificationRequirement.REQUIRED,
     )
     return options_to_json(opts), opts.challenge
 
@@ -98,7 +101,7 @@ def verify_authentication(credential, expected_challenge: bytes,
         expected_origin=origin(),
         credential_public_key=public_key,
         credential_current_sign_count=sign_count,
-        require_user_verification=False,
+        require_user_verification=True,
     )
 
 

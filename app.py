@@ -11,6 +11,7 @@ lire le digest. La clé LLM se colle dans "Réglages" (ou reste dans .env).
 import os
 import time
 import uuid
+import hmac
 import secrets
 import threading
 import subprocess
@@ -73,9 +74,42 @@ if not app.secret_key:
     app.secret_key = uuid.uuid4().hex
     store.set_setting("SECRET_KEY", app.secret_key)
 app.permanent_session_lifetime = dt.timedelta(days=30)
+# Durcissement du cookie de session. HttpOnly est déjà le défaut de Flask ; on
+# l'écrit quand même pour que l'intention soit explicite. SameSite=Lax bloque
+# l'envoi du cookie sur les POST venus d'un autre site (CSRF) tout en gardant les
+# liens entrants fonctionnels. Secure n'est posé QUE si l'origine est en HTTPS :
+# sinon la connexion en local (http://localhost) cesserait de fonctionner.
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=auth.origin().startswith("https://"),
+)
 
 # Chemins publics (pas de session requise).
 _PUBLIC_EXACT = {"/login", "/register", "/healthz", "/manifest.webmanifest"}
+
+
+def _is_local_request() -> bool:
+    """Vrai uniquement pour un accès direct en local (`python app.py`).
+    Derrière le reverse proxy, `remote_addr` vaut TOUJOURS 127.0.0.1 : on exige
+    donc en plus l'absence des en-têtes X-Forwarded-* que Caddy ajoute
+    systématiquement. Un client qui les falsifierait ne ferait que se bloquer
+    lui-même — l'erreur penche du côté sûr."""
+    if request.headers.get("X-Forwarded-For") or request.headers.get("X-Forwarded-Proto"):
+        return False
+    return (request.remote_addr or "") in ("127.0.0.1", "::1")
+
+
+def _bootstrap_blocked() -> bool:
+    """Sans code d'amorçage, la création du 1er admin n'est tolérée qu'en local.
+    Sur une instance publique fraîche, le premier visiteur raflerait sinon un
+    compte qui peut lancer `git pull` et redémarrer le service."""
+    return not CARDINAL_PASSWORD and not _is_local_request()
+
+
+_BOOTSTRAP_MSG = ("Création du premier compte désactivée : définis CARDINAL_PASSWORD "
+                  "dans /opt/cardinal/.env (puis redémarre le service) pour pouvoir "
+                  "créer le compte admin.")
 
 # Métadonnées « web app ». Safari n'autorise aucun site à masquer le domaine dans
 # sa barre d'adresse (anti-usurpation). En revanche, ajouté à l'écran d'accueil,
@@ -663,11 +697,15 @@ def register():
         return redirect(url_for("index"))
     bootstrap = store.count_users() == 0
     invite = (request.args.get("invite") or "").strip()
+    if bootstrap and _bootstrap_blocked():
+        return render_template_string(REGISTER_PAGE, error=_BOOTSTRAP_MSG,
+                                      bootstrap=True, need_code=False, invite="")
     if not bootstrap and not store.invite_is_valid(invite):
         return render_template_string(REGISTER_PAGE, error=(
             "Invitation invalide ou déjà utilisée. Demande un nouveau lien à l'admin."),
             bootstrap=False, need_code=False, invite="")
-    # Amorçage : code requis seulement si CARDINAL_PASSWORD est défini (prod).
+    # Amorçage : code requis dès que CARDINAL_PASSWORD est défini (prod). S'il ne
+    # l'est pas, on n'arrive ici qu'en local (cf. _bootstrap_blocked).
     need_code = bootstrap and bool(CARDINAL_PASSWORD)
     return render_template_string(REGISTER_PAGE, error="", bootstrap=bootstrap,
                                   need_code=need_code, invite=invite)
@@ -688,7 +726,11 @@ def wa_register_options():
         return ("Nom requis.", 400)
     bootstrap = store.count_users() == 0
     if bootstrap:
-        if CARDINAL_PASSWORD and (data.get("code") or "") != CARDINAL_PASSWORD:
+        if _bootstrap_blocked():
+            return (_BOOTSTRAP_MSG, 403)
+        # compare_digest : comparaison à temps constant (pas de fuite par timing).
+        if CARDINAL_PASSWORD and not hmac.compare_digest(
+                data.get("code") or "", CARDINAL_PASSWORD):
             return ("Code d'amorçage incorrect.", 403)
         is_admin = True
         invite = None
@@ -715,7 +757,10 @@ def wa_register_verify():
         v = auth.verify_registration(
             data.get("credential"), auth.b64url_to_bytes(reg["chal"]))
     except Exception as e:
-        return (f"Passkey refusée : {e}", 400)
+        # Détail en journal serveur uniquement : le renvoyer exposerait des
+        # internes de la vérification WebAuthn.
+        print(f"[webauthn] échec de vérification (inscription) : {e!r}")
+        return ("Passkey refusée.", 400)
     # Course anti-doublon : quelqu'un a-t-il pris l'admin entre-temps ?
     if reg["admin"] and store.count_users() != 0:
         session.pop("reg", None)
@@ -759,7 +804,8 @@ def wa_auth_verify():
         v = auth.verify_authentication(
             cred, auth.b64url_to_bytes(chal), row["public_key"], row["sign_count"])
     except Exception as e:
-        return (f"Passkey refusée : {e}", 400)
+        print(f"[webauthn] échec de vérification (connexion) : {e!r}")
+        return ("Passkey refusée.", 400)
     store.update_sign_count(cred["id"], v.new_sign_count)
     session.pop("auth_chal", None)
     session["uid"] = row["user_id"]

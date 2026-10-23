@@ -414,6 +414,35 @@ def t_ntfy_targets():
     assert app._ntfy_target_for("G") == ("", ""), "invité ne doit pas être notifié sans serveur"
 
 
+# 19) Garde-fou d'amorçage : sans code (CARDINAL_PASSWORD), la création du
+#     premier compte — qui est admin — doit être refusée depuis l'extérieur.
+#     Sinon le premier visiteur d'une instance publique rafle l'admin.
+def t_bootstrap_guard():
+    import app
+    store.init_db()
+    with store._conn() as c:
+        c.execute("DELETE FROM users")          # 0 compte = phase d'amorçage
+    proxy = {"X-Forwarded-For": "203.0.113.9"}  # en-tête ajouté par Caddy
+    c = app.app.test_client()
+    old = app.CARDINAL_PASSWORD
+    try:
+        app.CARDINAL_PASSWORD = None            # cas dangereux : aucun code
+        r = c.post("/webauthn/register/options", json={"name": "Pirate"}, headers=proxy)
+        assert r.status_code == 403, "amorçage public sans code : devrait être refusé"
+        r = c.post("/webauthn/register/options", json={"name": "Lucas"})
+        assert r.status_code == 200, "amorçage en local : devrait rester possible"
+
+        app.CARDINAL_PASSWORD = "secret"        # cas prod : code exigé
+        r = c.post("/webauthn/register/options",
+                   json={"name": "Pirate", "code": "faux"}, headers=proxy)
+        assert r.status_code == 403, "mauvais code : devrait être refusé"
+        r = c.post("/webauthn/register/options",
+                   json={"name": "Lucas", "code": "secret"}, headers=proxy)
+        assert r.status_code == 200, "bon code : devrait passer"
+    finally:
+        app.CARDINAL_PASSWORD = old
+
+
 print("Cardinal — self-test (hors-ligne)\n")
 check("Chargement des sujets", t_topics)
 check("Parsing RSS + fenêtre + nettoyage HTML", t_rss)
@@ -433,6 +462,7 @@ check("Reprise du legacy (sujets → 1er admin)", t_claim_legacy)
 check("Clés par-utilisateur (contexte de run)", t_user_keys_context)
 check("Rôle admin (@admin_required → 403)", t_admin_required)
 check("Cibles ntfy par-utilisateur (admin vs invité)", t_ntfy_targets)
+check("Garde-fou d'amorçage du compte admin", t_bootstrap_guard)
 
 # nettoyage
 for f in (store.DB_PATH,):
