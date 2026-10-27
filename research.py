@@ -65,14 +65,16 @@ def _cfg(key: str, default=None):
 PROVIDERS = {
     "gemini": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        # 2.5-flash : modèle gratuit actuel. (2.0-flash a été retiré côté Google →
-        # 404 NotFound.) Surchargeable via LLM_MODEL si Google le retire à son tour.
-        "model": "gemini-2.5-flash",
+        # Google retire régulièrement ses modèles « flash » pour les nouveaux
+        # comptes (2.0-flash puis 2.5-flash → 404 NotFound). 3.8-flash est
+        # l'actuel. Surchargeable via LLM_MODEL le jour où il saute à son tour.
+        "model": "gemini-3.8-flash",
         "key_env": "GEMINI_API_KEY",
     },
     "groq": {
         "base_url": "https://api.groq.com/openai/v1",
-        "model": "llama-3.3-70b-versatile",
+        # llama-3.3-70b-versatile a été retiré du catalogue Groq (404).
+        "model": "openai/gpt-oss-120b",
         "key_env": "GROQ_API_KEY",
     },
     "openrouter": {
@@ -351,10 +353,23 @@ def _fetch_feed_items(feeds: list, since: dt.datetime, max_items: int = 25) -> l
     return items[:max_items]
 
 
+# La plupart des sources sont en anglais (Hacker News, NVD, OSV, GitHub…). Sans
+# consigne explicite, le modèle recopie titres et extraits tels quels : on rappelle
+# donc la règle de langue dans CHAQUE prompt, en tête des règles.
+RULE_FR = """- ÉCRIS TOUT EN FRANÇAIS, même quand les sources sont en anglais ou dans
+  une autre langue : TRADUIS-les. Ne recopie JAMAIS une phrase ni un titre tel quel.
+  Cela vaut pour "headline", "summary", et pour "title" et "body" de chaque item.
+  Restent inchangés : noms propres, noms de produits et de paquets, identifiants
+  (CVE-2024-1234, GHSA-…), numéros de version, extraits de code et URLs.
+  Seul le "title" dans "sources" garde le titre original de l'article (c'est une
+  citation : il doit correspondre à ce que verra la personne en cliquant)."""
+
+
 SYSTEM_WEB = """Tu es un rédacteur de veille. On te fournit des articles récents
 (titre, résumé, lien) issus de flux RSS. Tu écris un digest en français.
 
 Règles STRICTES :
+""" + RULE_FR + """
 - Ne te sers QUE des articles fournis. N'invente aucune information ni aucun lien.
 - Sélectionne et regroupe les 3 à 6 sujets les plus importants (ignore le bruit).
 - Chaque item : un titre, 1 à 3 paragraphes de synthèse, et pour "sources" les liens
@@ -492,6 +507,7 @@ def _fetch_osv(package: dict, since: dt.datetime) -> list:
 SYSTEM_OSV = """Tu es un analyste sécurité. On te donne des vulnérabilités OSV.dev
 pour les paquets d'un utilisateur. Rédige un digest en français, priorisé.
 
+""" + RULE_FR + """
 - Un item par vulnérabilité notable (regroupe les doublons).
 - Commence TOUJOURS le titre par le paquet affecté entre crochets (champ "package"),
   ex. "[Next.js] ...", "[requests] déni de service via...". Puis décris le risque.
@@ -655,6 +671,7 @@ Le champ `matched` = le mot-clé (donc le produit) recherché. Règles de pertin
 - Si après filtrage il ne reste rien de pertinent, renvoie "items": [] (liste vide).
 
 Pour chaque item conservé :
+""" + RULE_FR + """
 - Commence le titre par le produit RÉELLEMENT vulnérable entre crochets (le vrai
   logiciel touché, qui doit être le produit recherché) : "[Windows 11] ...".
 - Explique le risque.
